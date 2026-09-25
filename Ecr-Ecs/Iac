@@ -1,0 +1,88 @@
+pipeline {
+    agent {
+        
+        label "master"
+    }
+     
+    parameters {
+       choice(
+            choices: ['communication-api'],
+            description: 'Ecr repo name',
+            name: 'EcrRepoName'
+        )
+        
+        choice(
+            choices: ['Communication-Api'],
+            description: 'Systems Manager Parameter Name for App Settings',
+            name: 'AppSettingsParameterName'
+        )
+        
+        
+       
+    }
+
+    stages {
+        stage('Create Ecr') {
+            steps {
+                withAWS(credentials: 'MOS') {
+                    sh "aws cloudformation create-stack --stack-name Communication-Api-ECR --template-body file://cloudformation/ecr.yml --parameters ParameterKey=EcrRepositoryName,ParameterValue=${params.EcrRepoName} --tags Key=\"map-migrated\",Value=\"migYKTPNQJRTN\" --capabilities CAPABILITY_NAMED_IAM"
+                    sh "aws cloudformation wait stack-create-complete --stack-name Communication-Api-ECR"
+                }
+            }
+        }
+
+        stage('Retrieve ECR URL') {
+            steps {
+                script {
+                    def ecrUrl = sh(
+                        script: 'AWS_PROFILE=Mos aws cloudformation describe-stacks --stack-name  Communication-Api-ECR --query "Stacks[0].Outputs[?OutputKey==\'ECRRepositoryURL\'].OutputValue" --output text',
+                        returnStdout: true
+                    ).trim()
+                    env.ECR_URL = ecrUrl
+                }
+            }
+        }
+
+        
+
+       stage('Build and push') {
+            agent {
+                label 'aws.ec2.eu.west-2.jenkins.worker'
+            }
+            steps {
+                git 'git@bitbucket.org:moresand/communication_api.git'
+                
+                
+                sh "rm -rf src/MOSCommunicationAPI/appsettings.json"
+                
+                
+                withAWS(credentials: 'MOS') {
+                    sh "aws ssm get-parameter --name ${params.AppSettingsParameterName} --query 'Parameter.Value' --output text > src/MOSCommunicationAPI/appsettings.json"
+                
+                    script {
+                        def timestamp = new Date().format("yyyyMMddHHmmss")
+                        
+                        sh "docker build -t ${params.EcrRepoName}:${timestamp} --build-arg APP_SETTINGS=appsettings.json ."
+                    
+                        sh 'aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin 397753xxxxxx.dkr.ecr.eu-west-2.amazonaws.com'
+                        sh "docker tag ${params.EcrRepoName}:${timestamp} $ECR_URL:${timestamp}"
+                        sh "docker push $ECR_URL:${timestamp}"
+                    
+                        env.TIMESTAMP = timestamp
+                    }
+                }
+            }     
+        }
+        
+
+      stage('Deploy to ECS') {
+            steps {
+                withAWS(credentials: 'MOS') {
+                    sh "aws cloudformation create-stack --stack-name Communication-Api-ECS --template-body file://cloudformation/iac_Communication-Api.yml --parameters ParameterKey=ECRRepository,ParameterValue=$ECR_URL ParameterKey=Service,ParameterValue=Communication-Api ParameterKey=ECRRepositoryURL,ParameterValue=$ECR_URL ParameterKey=Version,ParameterValue=$TIMESTAMP --tags Key=\"map-migrated\",Value=\"migYKTPNQJRTN\" --capabilities CAPABILITY_NAMED_IAM"
+
+                }
+            }
+        }
+    }
+
+}

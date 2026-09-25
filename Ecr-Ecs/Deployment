@@ -1,0 +1,311 @@
+pipeline {
+    agent {
+        label "master"
+    }
+    environment {
+        SLACK_CHANNEL = '#prod-deployments'
+        ONCALL_ALERT_CHANNEL = '#oncall-devops'
+    }
+    parameters {
+        choice(
+            choices: ['Communication-Api'],
+            description: 'Systems Manager Parameter Name for App Settings',
+            name: 'AppSettingsParameterName'
+        )
+        booleanParam(name: 'VulnerabilityScan',
+        defaultValue: true,
+        description: 'Scan image for vulnerabilities')
+        booleanParam(
+            name: 'IaCOnly',
+            defaultValue: false,
+            description: 'Skip build/push/scan — only apply CloudFormation changes using the currently deployed image (ECRRepository, ECRRepositoryURL and Version parameters are reused from the live stack)'
+        )
+    }
+    stages {
+        stage('Deployment-Pipeline-Started') {
+            steps {
+                script {
+                    env.LAST_STAGE = 'Deployment-Pipeline-Started'
+                    wrap([$class: 'BuildUser']) {
+                        def startTime = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('UTC'))
+                        env.BUILD_USER = "${BUILD_USER_ID ?: 'unknown'}"
+                        def mode = params.IaCOnly ? "IaC-only (no image build)" : "Full deployment"
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: '#439FE0',
+                            message: ":rocket: *Deployment Pipeline Started*\n" +
+                                     "*Mode:* ${mode}\n" +
+                                     "*User:* ${env.BUILD_USER}\n" +
+                                     "*Job:* ${env.JOB_NAME}\n" +
+                                     "*Build:* ${env.BUILD_NUMBER}\n" +
+                                     "*Start Time:* ${startTime}"
+                        )
+                    }
+                }
+            }
+        }
+        stage('Checkout') {
+            // Only runs on full deployments. On IaC-only runs, the top-level
+            // agent's workspace is expected to already have the current
+            // cloudformation/ files (persisted from the last full run, or
+            // edited directly on the node) — no fresh clone is done.
+            when {
+                beforeAgent true
+                expression { return !params.IaCOnly }
+            }
+            steps {
+                script {
+                    env.LAST_STAGE = 'Checkout'
+                }
+                git 'git@bitbucket.org:moresand/communication_api.git'
+                sh "echo '📂 Checked out on top-level agent:' && ls -la cloudformation/"
+            }
+        }
+        stage('Retrieve ECR URL') {
+            steps {
+                script {
+                    env.LAST_STAGE = 'Retrieve ECR URL'
+                    withAWS(credentials: 'MOS') {
+                        def ecrUrl = sh(
+                            script: 'aws cloudformation describe-stacks --stack-name  Communication-Api-ECR --query "Stacks[0].Outputs[?OutputKey==\'ECRRepositoryURL\'].OutputValue" --output text',
+                            returnStdout: true
+                        ).trim()
+                        env.ECR_URL = ecrUrl
+                        sh "echo $ECR_URL"
+                    }
+                }
+            }
+        }
+        stage('Build and push') {
+            agent {
+                label 'aws.ec2.eu.west-2.jenkins.worker'
+            }
+            when {
+                beforeAgent true
+                expression { return !params.IaCOnly }
+            }
+            steps {
+                git 'git@bitbucket.org:moresand/communication_api.git'
+              //  sh "rm -rf src/MOSCommunicationAPI/appsettings.json"
+                withAWS(credentials: 'MOS') {
+                 //   sh "aws ssm get-parameter --name ${params.AppSettingsParameterName} --query 'Parameter.Value' --output text > src/MOSCommunicationAPI/appsettings.json"
+                    script {
+                        def timestamp = new Date().format("yyyyMMddHHmmss")
+                        sh "docker build -t ${params.EcrRepoName}:${timestamp} --build-arg APP_SETTINGS=appsettings.json ."
+                        sh 'aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin 397753518402.dkr.ecr.eu-west-2.amazonaws.com'
+                        sh "docker tag ${params.EcrRepoName}:${timestamp} $ECR_URL:${timestamp}"
+                        sh "docker push $ECR_URL:${timestamp}"
+                        env.TIMESTAMP = timestamp
+                    }
+                }
+            }
+        }
+        stage('Trigger Trivy Scan') {
+            when {
+                expression { return !params.IaCOnly }
+            }
+            steps {
+                script {
+                    env.LAST_STAGE = 'Trigger Trivy Scan'
+                    if (params.VulnerabilityScan) {
+                        echo "Running Trivy scan..."
+                        build wait: true, propagate: true, job: '/Maintenance/trivy-scan', parameters: [
+                                string(name: 'MAXVULCOUNT', value: "5"),
+                                string(name: 'REGISTRY', value: "3977535XXXXX.dkr.ecr.eu-west-2.amazonaws.com"),
+                                string(name: 'ECR_URL', value: "${ECR_URL}"),
+                                // Was "${timestamp}" (local var, out of scope here) —
+                                // env.TIMESTAMP is what "Build and push" actually exposes.
+                                string(name: 'IMAGE_TAG', value: "${env.TIMESTAMP}"),
+                                string(name: 'AWS_ACCOUNT_ID', value: '397753518402'),
+                                string(name: 'REGION', value: "eu-west-2")
+                            ]
+                    } else {
+                        echo "Image Scan Skipped."
+                    }
+                }
+            }
+        }
+        stage('Deploy to ECS') {
+            steps {
+                script {
+                    env.LAST_STAGE = 'Deploy to ECS'
+                    withAWS(credentials: 'MOS') {
+                        echo "🛠️ Creating CloudFormation Change Set for Communication-Api..."
+                        // On IaCOnly runs, reuse the image-related parameters
+                        // from the currently deployed stack instead of
+                        // supplying new values — this is what lets a run
+                        // apply template changes without touching the image.
+                        def paramsArg
+                        if (params.IaCOnly) {
+                            echo "IaC-only run: reusing ECRRepository, ECRRepositoryURL, Service and Version from the live stack."
+                            paramsArg = "ParameterKey=ECRRepository,UsePreviousValue=true " +
+                                        "ParameterKey=Service,UsePreviousValue=true " +
+                                        "ParameterKey=ECRRepositoryURL,UsePreviousValue=true " +
+                                        "ParameterKey=Version,UsePreviousValue=true"
+                        } else {
+                            paramsArg = "ParameterKey=ECRRepository,ParameterValue=$ECR_URL " +
+                                        "ParameterKey=Service,ParameterValue=Communication-Api " +
+                                        "ParameterKey=ECRRepositoryURL,ParameterValue=$ECR_URL " +
+                                        "ParameterKey=Version,ParameterValue=$env.TIMESTAMP"
+                        }
+                        // Fail fast with a clear message instead of letting
+                        // the AWS CLI throw a cryptic "No such file" error.
+                        // Anchored to $WORKSPACE rather than a relative path —
+                        // this is this service's own template filename.
+                        def cfnTemplatePath = "${env.WORKSPACE}/cloudformation/Deployment-Communication-Api.yml"
+                        sh """
+                            if [ ! -f "${cfnTemplatePath}" ]; then
+                                echo "❌ Template not found at ${cfnTemplatePath}"
+                                echo "   Workspace: \$WORKSPACE"
+                                echo "   Contents of \$WORKSPACE/cloudformation:"
+                                ls -la "\$WORKSPACE/cloudformation" || echo "   (cloudformation/ directory does not exist)"
+                                exit 1
+                            fi
+                        """
+                        // Create change set
+                        sh """
+                            aws cloudformation create-change-set \
+                                --stack-name Communication-Api-ECS \
+                                --change-set-name my-change-set \
+                                --template-body file://${cfnTemplatePath} \
+                                --parameters ${paramsArg} \
+                                --tags Key="map-migrated",Value="migYKTPNQJRTN" \
+                                --capabilities CAPABILITY_NAMED_IAM
+                        """
+                        // Wait for the change set to be created
+                        echo "⏳ Waiting for change set to reach CREATE_COMPLETE status..."
+                        timeout(time: 5, unit: 'MINUTES') {
+                            waitUntil {
+                                def status = sh(
+                                    script: "aws cloudformation describe-change-set --stack-name Communication-Api-ECS --change-set-name my-change-set --query 'Status' --output text",
+                                    returnStdout: true
+                                ).trim()
+                                if (status == "FAILED") {
+                                    def reason = sh(
+                                        script: "aws cloudformation describe-change-set --stack-name Communication-Api-ECS --change-set-name my-change-set --query 'StatusReason' --output text",
+                                        returnStdout: true
+                                    ).trim()
+                                    echo "⚠️ Change set status FAILED. Reason: ${reason}"
+                                    // A change set can legitimately have "no changes"
+                                    // on an IaC-only run if you re-ran without editing
+                                    // the template — don't treat that as a hard failure.
+                                    // Keep the (empty) change set around and log it
+                                    // plainly instead of silently deleting it.
+                                    if (reason.contains("didn't contain changes")) {
+                                        env.NO_CHANGES = 'true'
+                                        return true
+                                    }
+                                    error "❌ Change set creation failed: ${reason}"
+                                }
+                                return (status == "CREATE_COMPLETE")
+                            }
+                        }
+                        if (env.NO_CHANGES == 'true') {
+                            echo "❗ ℹ️ CloudFormation reports NO CHANGES between the template you submitted and what's currently deployed."
+                            echo "❗ If you expected changes, check: (1) your edits were pushed/merged to the branch this pipeline checks out, (2) the 'Checkout' stage sparse-pulled the current cloudformation/Deployment-Communication-Api.yml, (3) you're not accidentally comparing against a different stack/region."
+                            sh "aws cloudformation delete-change-set --stack-name Communication-Api-ECS --change-set-name my-change-set"
+                        } else {
+                            echo "📋 Changes to be applied:"
+                            sh "aws cloudformation describe-change-set --stack-name Communication-Api-ECS --change-set-name my-change-set --query 'Changes[].ResourceChange.[Action,LogicalResourceId,PhysicalResourceId,Replacement]' --output table"
+                            echo "🚀 Executing change set..."
+                            sh "aws cloudformation execute-change-set --stack-name Communication-Api-ECS --change-set-name my-change-set"
+                            echo "⏳ Waiting for stack update to complete..."
+                            sh "aws cloudformation wait stack-update-complete --stack-name Communication-Api-ECS"
+                            echo "✅ Stack update completed successfully!"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            agent {
+                label "master"
+            }
+            script {
+                wrap([$class: 'BuildUser']) {
+                    def status = currentBuild.currentResult
+                    def endTime = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('UTC'))
+                    def colorMap = [
+                        'SUCCESS' : '#36a64f',
+                        'FAILURE' : '#FF0000',
+                        'ABORTED' : '#FFA500',
+                        'UNSTABLE': '#FFFF00'
+                    ]
+                    def emojiMap = [
+                        'SUCCESS' : ':white_check_mark:',
+                        'FAILURE' : ':x:',
+                        'ABORTED' : ':warning:',
+                        'UNSTABLE': ':warning:'
+                    ]
+                    def color = colorMap.get(status, '#CCCCCC')
+                    def emoji = emojiMap.get(status, ':grey_question:')
+                    def logSnippet = ''
+                    def logScanLines = 200  // increase scan depth for safety
+                    if (status != 'SUCCESS') {
+                        try {
+                            def lines = currentBuild.rawBuild.getLog(logScanLines)
+                            def errorIndex = lines.findIndexOf { line ->
+                                def lower = line.toLowerCase()
+                                return lower.contains("error") ||
+                                       lower.contains("fail") ||
+                                       lower.contains("exception") ||
+                                       lower.contains("not found") ||
+                                       lower.contains("exit code") ||
+                                       lower.contains("failed") ||
+                                       lower.contains("unable to") ||
+                                       lower.contains("cannot") ||
+                                       lower.contains("timed out") ||
+                                       lower.contains("rejected") ||
+                                       lower.contains("denied") ||
+                                       lower.contains("missing") ||
+                                       lower.contains("invalid") ||
+                                       lower.contains("fatal") ||
+                                       lower.contains("stack trace") ||
+                                       lower.contains("traceback") ||
+                                       lower.contains("runtimeexception") ||
+                                       lower.contains("nullpointerexception") ||
+                                       lower.contains("erroraction") ||
+                                       lower.contains("groovy.runtime") ||
+                                       lower.contains("cannot get property") ||
+                                       lower.contains("on null object")
+                            }
+                            if (errorIndex != -1) {
+                                def endIndex = Math.min(errorIndex + 20, lines.size()) // error line + 20 more
+                                logSnippet = lines.subList(errorIndex, endIndex).join("\n")
+                            } else {
+                                logSnippet = "No critical error lines found."
+                            }
+                        } catch (err) {
+                            logSnippet = "Log access failed: ${err.message}"
+                        }
+                    }
+                    def modeLabel = params.IaCOnly ? "IaC-only" : "Full deployment"
+                    def baseMessage = "${emoji} *Deployment Pipeline ${status}*\n" +
+                                      "*Mode:* ${modeLabel}\n" +
+                                      "*User:* ${env.BUILD_USER}\n" +
+                                      "*Job:* ${env.JOB_NAME}\n" +
+                                      "*Build:* ${env.BUILD_NUMBER}\n" +
+                                      "*Last Stage:* ${env.LAST_STAGE ?: 'Unknown'}\n" +
+                                      "*End Time:* ${endTime}"
+                    def failureNote = status != 'SUCCESS' ? "\n*Error Snippet (first match + 20 lines):*\n```${logSnippet}```" : ""
+                    if (status != 'FAILURE') {
+                     slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: color,
+                        message: baseMessage + failureNote
+                     )
+                    }
+                    if (status == 'FAILURE') {
+                        slackSend(
+                            channel: env.ONCALL_ALERT_CHANNEL,
+                            color: color,
+                            message: baseMessage + failureNote
+                        )
+                    }
+                }
+             }
+          }
+       }
+    }

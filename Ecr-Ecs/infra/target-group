@@ -1,0 +1,19 @@
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    parameters {
+        string(description: 'export variable ', name: 'targetgroup')
+    }
+    
+    stages {
+        stage('Create target Group') {
+            steps {
+                withAWS(credentials: 'MOS') {
+                    sh "aws cloudformation create-stack --stack-name Communication-Api-Target-group --template-body file://cloudformation/target-group-Communication-Api.yml --parameters ParameterKey=Targetgroup,ParameterValue=${params.targetgroup} --tags Key=\"map-migrated\",Value=\"migYKTPNQJRTN\" --capabilities CAPABILITY_NAMED_IAM"
+                }
+            }
+        }
+    }
+}
