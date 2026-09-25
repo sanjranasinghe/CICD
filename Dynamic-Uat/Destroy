@@ -1,0 +1,387 @@
+pipeline {
+ agent any
+// agent {
+//     label 'master'   // or 'built-in' depending on your setup
+// }
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    AWS_REGION            = "${params.Region ?: 'eu-west-2'}"
+    AWS_DEFAULT_REGION    = "${params.Region ?: 'eu-west-2'}"
+    AWS_CREDENTIALS_ID    = 'London_Region'
+    ALB_ARN               = 'arn:aws:elasticloadbalancing:eu-west-2:715451173743:loadbalancer/app/Sandbox-Dynamic-UAT-LB/f019785ce5474a92'
+    BASE_DOMAIN           = 'uat.moresand.io'
+    PUBLIC_HOSTED_ZONE_ID = 'Z1022656K7AKO21GKF5F'
+  }
+
+  stages {
+      stage('Confirm Destroy') {
+  steps {
+    script {
+      def svc = params.EXISTING_SERVICE ?: 'UNKNOWN'
+
+      def userInput = input(
+        id: 'DestroyApproval',
+        message: """⚠️ CONFIRM ECS DESTROY ⚠️
+
+You are about to DELETE the service:
+
+Service : ${svc}
+
+This action is IRREVERSIBLE.
+
+Tick the checkbox and click PROCEED to continue.
+""",
+        parameters: [
+          booleanParam(
+            defaultValue: false,
+            description: 'Yes, I understand and want to destroy this service',
+            name: 'CONFIRM_DESTROY'
+          )
+        ]
+      )
+
+      if (!userInput) {
+        error("Destroy not confirmed. Aborting pipeline.")
+      }
+    }
+  }
+}
+    stage('Resolve Target') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def selectedService = (params.EXISTING_SERVICE ?: '').toString().trim()
+            if (!selectedService) {
+              error "EXISTING_SERVICE is required."
+            }
+            if (!(selectedService ==~ /^uat-.+-service$/)) {
+              error "EXISTING_SERVICE must match pattern uat-<name>-service."
+            }
+
+            def depName = selectedService.replaceFirst(/^uat-/, '').replaceFirst(/-service$/, '')
+            env.DEPLOYMENT_NAME = depName
+            env.ECS_SERVICE_NAME = selectedService
+            env.ECS_CLUSTER_NAME = "uat-${depName}-cluster"
+            env.ECR_REPO_NAME = "uat-${depName}"
+            env.TG_NAME = ("uat-" + depName).replaceAll('[^a-z0-9-]', '-').take(32)
+            env.LOG_GROUP_NAME = "/ecs/${depName}"
+            env.HOST_FQDN = "${depName}.${env.BASE_DOMAIN}"
+
+            def serviceStatus = sh(script: """
+              aws ecs describe-services \
+                --cluster ${env.ECS_CLUSTER_NAME} \
+                --services ${env.ECS_SERVICE_NAME} \
+                --region ${env.AWS_REGION} \
+                --query 'services[0].status' \
+                --output text 2>/dev/null || echo ""
+            """, returnStdout: true).trim()
+
+            if (!serviceStatus || serviceStatus == 'None') {
+              error "Service '${env.ECS_SERVICE_NAME}' not found in cluster '${env.ECS_CLUSTER_NAME}'."
+            }
+
+            env.TG_ARN = sh(script: """
+              aws ecs describe-services \
+                --cluster ${env.ECS_CLUSTER_NAME} \
+                --services ${env.ECS_SERVICE_NAME} \
+                --region ${env.AWS_REGION} \
+                --query 'services[0].loadBalancers[0].targetGroupArn' \
+                --output text 2>/dev/null || echo ""
+            """, returnStdout: true).trim()
+
+            if (!env.TG_ARN || env.TG_ARN == 'None') {
+              env.TG_ARN = sh(script: """
+                aws elbv2 describe-target-groups \
+                  --names ${env.TG_NAME} \
+                  --region ${env.AWS_REGION} \
+                  --query 'TargetGroups[0].TargetGroupArn' \
+                  --output text 2>/dev/null || echo ""
+              """, returnStdout: true).trim()
+            }
+
+            echo "Destroy target:"
+            echo "  Deployment : ${env.DEPLOYMENT_NAME}"
+            echo "  Cluster    : ${env.ECS_CLUSTER_NAME}"
+            echo "  Service    : ${env.ECS_SERVICE_NAME}"
+            echo "  TargetGroup: ${env.TG_ARN ?: 'N/A'}"
+            echo "  Log Group  : ${env.LOG_GROUP_NAME}"
+            echo "  ECR Repo   : ${env.ECR_REPO_NAME}"
+            echo "  URL        : https://${env.HOST_FQDN}/"
+          }
+        }
+      }
+    }
+
+    stage('Delete ALB Rule') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          sh """#!/usr/bin/env bash
+set -euo pipefail
+LISTENER_JSON=\$(aws elbv2 describe-listeners --load-balancer-arn "${env.ALB_ARN}" --region "${env.AWS_REGION}" --output json)
+LISTENER_ARN=\$(python3 - "\$LISTENER_JSON" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else {"Listeners":[]}
+listeners = data.get("Listeners", [])
+arn = ""
+for l in listeners:
+    if l.get("Port") == 443:
+        arn = l.get("ListenerArn")
+        break
+if not arn:
+    for l in listeners:
+        if l.get("Port") == 80:
+            arn = l.get("ListenerArn")
+            break
+print(arn or "")
+PY
+)
+
+if [ -z "\$LISTENER_ARN" ]; then
+  echo "No ALB listener found; skipping ALB rule deletion."
+  exit 0
+fi
+
+RULE_ARN=\$(aws elbv2 describe-rules --listener-arn "\$LISTENER_ARN" --region "${env.AWS_REGION}" \\
+  --query "Rules[?Conditions[?Field=='host-header' && contains(join('',Values),'${env.HOST_FQDN}')]].RuleArn | [0]" \\
+  --output text 2>/dev/null || true)
+
+if [ -n "\$RULE_ARN" ] && [ "\$RULE_ARN" != "None" ]; then
+  echo "Deleting ALB rule \$RULE_ARN"
+  aws elbv2 delete-rule --rule-arn "\$RULE_ARN" --region "${env.AWS_REGION}" || true
+else
+  echo "No ALB rule found for ${env.HOST_FQDN}; skipping."
+fi
+"""
+        }
+      }
+    }
+
+    stage('Delete DNS Record') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          sh """#!/usr/bin/env bash
+set -euo pipefail
+HOST="${env.HOST_FQDN}."
+ZONE="${env.PUBLIC_HOSTED_ZONE_ID}"
+
+REC=\$(aws route53 list-resource-record-sets --hosted-zone-id "\$ZONE" \\
+  --query "ResourceRecordSets[?Name=='\$HOST' && Type=='A'] | [0]" \\
+  --output json 2>/dev/null || echo "null")
+
+if [ -z "\$REC" ] || [ "\$REC" = "null" ] || [ "\$REC" = "None" ]; then
+  echo "No Route53 A record found for \$HOST; skipping."
+  exit 0
+fi
+
+python3 - "\$REC" > dns-delete.json <<'PY'
+import json, sys
+rec = json.loads(sys.argv[1])
+print(json.dumps({"Changes":[{"Action":"DELETE","ResourceRecordSet":rec}]}))
+PY
+
+aws route53 change-resource-record-sets \\
+  --hosted-zone-id "\$ZONE" \\
+  --change-batch file://dns-delete.json || true
+"""
+        }
+      }
+    }
+
+    stage('Delete ECS Service') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          sh """#!/bin/bash
+set -euo pipefail
+echo "Scaling service to 0..."
+aws ecs update-service \
+  --cluster ${env.ECS_CLUSTER_NAME} \
+  --service ${env.ECS_SERVICE_NAME} \
+  --desired-count 0 \
+  --region ${env.AWS_REGION} || true
+
+echo "Deleting service..."
+aws ecs delete-service \
+  --cluster ${env.ECS_CLUSTER_NAME} \
+  --service ${env.ECS_SERVICE_NAME} \
+  --force \
+  --region ${env.AWS_REGION} || true
+
+echo "Waiting service inactive..."
+aws ecs wait services-inactive \
+  --cluster ${env.ECS_CLUSTER_NAME} \
+  --services ${env.ECS_SERVICE_NAME} \
+  --region ${env.AWS_REGION} || true
+"""
+        }
+      }
+    }
+    stage('Delete Task Definitions') {
+  steps {
+    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+
+      sh """#!/bin/bash
+set -euo pipefail
+
+TASK_FAMILY="uat-${env.DEPLOYMENT_NAME}-task"
+
+echo "========================================"
+echo "Deleting ECS Task Definitions"
+echo "Task Family: \$TASK_FAMILY"
+echo "========================================"
+
+TASK_DEFS=\$(aws ecs list-task-definitions \
+  --family-prefix "\$TASK_FAMILY" \
+  --region ${env.AWS_REGION} \
+  --query 'taskDefinitionArns[]' \
+  --output text 2>/dev/null || true)
+
+if [ -z "\$TASK_DEFS" ] || [ "\$TASK_DEFS" = "None" ]; then
+  echo "No task definitions found."
+  exit 0
+fi
+
+for TASK_ARN in \$TASK_DEFS; do
+
+  echo "Deregistering task definition:"
+  echo "\$TASK_ARN"
+
+  aws ecs deregister-task-definition \
+    --task-definition "\$TASK_ARN" \
+    --region ${env.AWS_REGION} || true
+
+done
+
+echo "========================================"
+echo "Task definitions deregistered successfully"
+echo "========================================"
+"""
+    }
+  }
+}
+
+    stage('Delete ECS Cluster') {
+      steps {
+        retry(3) {
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+            sh """#!/bin/bash
+set -euo pipefail
+aws ecs delete-cluster --cluster ${env.ECS_CLUSTER_NAME} --region ${env.AWS_REGION} || true
+"""
+          }
+        }
+      }
+    }
+
+    stage('Delete Target Group, Logs, ECR') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          sh """#!/bin/bash
+set -euo pipefail
+
+TG_ARN="${env.TG_ARN}"
+if [ -z "\$TG_ARN" ] || [ "\$TG_ARN" = "None" ]; then
+  TG_ARN=\$(aws elbv2 describe-target-groups \
+    --names ${env.TG_NAME} \
+    --region ${env.AWS_REGION} \
+    --query 'TargetGroups[0].TargetGroupArn' \
+    --output text 2>/dev/null || true)
+fi
+
+if [ -n "\$TG_ARN" ] && [ "\$TG_ARN" != "None" ]; then
+  echo "Ensuring no listener rules still forward to target group: \$TG_ARN"
+  LB_ARNS=\$(aws elbv2 describe-target-groups --target-group-arns "\$TG_ARN" --region ${env.AWS_REGION} --query 'TargetGroups[0].LoadBalancerArns[]' --output text 2>/dev/null || true)
+  if [ -z "\$LB_ARNS" ] || [ "\$LB_ARNS" = "None" ]; then
+    LB_ARNS="${env.ALB_ARN}"
+  fi
+
+  for LB_ARN in \$LB_ARNS; do
+    [ -z "\$LB_ARN" ] && continue
+    for LISTENER_ARN in \$(aws elbv2 describe-listeners --load-balancer-arn "\$LB_ARN" --region ${env.AWS_REGION} --query 'Listeners[].ListenerArn' --output text 2>/dev/null || true); do
+      [ -z "\$LISTENER_ARN" ] && continue
+
+      for RULE_ARN in \$(aws elbv2 describe-rules --listener-arn "\$LISTENER_ARN" --region ${env.AWS_REGION} \
+        --query "Rules[?Actions[?Type=='forward' && (TargetGroupArn=='\$TG_ARN' || ForwardConfig.TargetGroups[?TargetGroupArn=='\$TG_ARN'])]].RuleArn" --output text 2>/dev/null || true); do
+        [ -z "\$RULE_ARN" ] && continue
+        [ "\$RULE_ARN" = "None" ] && continue
+        echo "Deleting listener rule \$RULE_ARN"
+        aws elbv2 delete-rule --rule-arn "\$RULE_ARN" --region ${env.AWS_REGION} || true
+      done
+
+      DEFAULT_USES_TG=\$(aws elbv2 describe-listeners --listener-arns "\$LISTENER_ARN" --region ${env.AWS_REGION} \
+        --query "Listeners[0].DefaultActions[?Type=='forward' && (TargetGroupArn=='\$TG_ARN' || ForwardConfig.TargetGroups[?TargetGroupArn=='\$TG_ARN'])] | length(@)" \
+        --output text 2>/dev/null || echo "0")
+      if [ "\$DEFAULT_USES_TG" != "0" ]; then
+        echo "WARNING: Listener default action still points to target group: \$LISTENER_ARN"
+      fi
+    done
+  done
+
+  echo "Deleting target group with retries..."
+  TG_DELETED="false"
+  for i in {1..10}; do
+    if aws elbv2 delete-target-group --target-group-arn "\$TG_ARN" --region ${env.AWS_REGION}; then
+      echo "Target group deleted."
+      TG_DELETED="true"
+      break
+    fi
+    echo "Target group still in use, retry \$i/10..."
+    sleep 10
+  done
+
+  if [ "\$TG_DELETED" != "true" ]; then
+    echo "ERROR: Target group could not be deleted: \$TG_ARN"
+    echo "Checking remaining references..."
+    for LB_ARN in \$LB_ARNS; do
+      [ -z "\$LB_ARN" ] && continue
+      echo "Load balancer: \$LB_ARN"
+      for LISTENER_ARN in \$(aws elbv2 describe-listeners --load-balancer-arn "\$LB_ARN" --region ${env.AWS_REGION} --query 'Listeners[].ListenerArn' --output text 2>/dev/null || true); do
+        [ -z "\$LISTENER_ARN" ] && continue
+        RULES=\$(aws elbv2 describe-rules --listener-arn "\$LISTENER_ARN" --region ${env.AWS_REGION} \
+          --query "Rules[?Actions[?Type=='forward' && (TargetGroupArn=='\$TG_ARN' || ForwardConfig.TargetGroups[?TargetGroupArn=='\$TG_ARN'])]].RuleArn" \
+          --output text 2>/dev/null || true)
+        DEFAULT_USES_TG=\$(aws elbv2 describe-listeners --listener-arns "\$LISTENER_ARN" --region ${env.AWS_REGION} \
+          --query "Listeners[0].DefaultActions[?Type=='forward' && (TargetGroupArn=='\$TG_ARN' || ForwardConfig.TargetGroups[?TargetGroupArn=='\$TG_ARN'])] | length(@)" \
+          --output text 2>/dev/null || echo "0")
+        if [ -n "\$RULES" ] && [ "\$RULES" != "None" ]; then
+          echo "  Blocking rules on listener \$LISTENER_ARN: \$RULES"
+        fi
+        if [ "\$DEFAULT_USES_TG" != "0" ]; then
+          echo "  Blocking default action on listener: \$LISTENER_ARN"
+        fi
+      done
+    done
+    exit 1
+  fi
+fi
+
+aws logs delete-log-group --log-group-name ${env.LOG_GROUP_NAME} --region ${env.AWS_REGION} || true
+
+aws ecr delete-repository --repository-name ${env.ECR_REPO_NAME} --force --region ${env.AWS_REGION} || true
+"""
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo """
+========================================
+ECS DESTROY SUCCESSFUL
+========================================
+Deployment : ${env.DEPLOYMENT_NAME}
+Cluster    : ${env.ECS_CLUSTER_NAME}
+Service    : ${env.ECS_SERVICE_NAME}
+URL        : https://${env.HOST_FQDN}/
+========================================
+"""
+    }
+    failure {
+      echo "ECS destroy failed"
+    }
+  }
+}

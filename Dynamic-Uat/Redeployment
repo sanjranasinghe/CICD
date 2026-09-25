@@ -1,0 +1,825 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+
+def mergeEnvironmentVariables(List baseVars, String overridesText) {
+  def merged = new LinkedHashMap<String, String>()
+
+  (baseVars ?: []).each { entry ->
+    if (entry?.name != null) {
+      merged[entry.name.toString()] = entry.value == null ? '' : entry.value.toString()
+    }
+  }
+
+  overridesText?.readLines()?.eachWithIndex { rawLine, index ->
+    def line = (rawLine ?: '').trim()
+    if (!line || line.startsWith('#')) {
+      return
+    }
+
+    if (line.startsWith('!')) {
+      def keyToRemove = line.substring(1).trim()
+      if (!keyToRemove) {
+        throw new IllegalArgumentException("Environment_Variables line ${index + 1} has an invalid remove instruction.")
+      }
+      merged.remove(keyToRemove)
+      return
+    }
+
+    int separatorIndex = line.indexOf('=')
+    if (separatorIndex <= 0) {
+      throw new IllegalArgumentException("Environment_Variables line ${index + 1} must use KEY=VALUE format.")
+    }
+
+    def key = line.substring(0, separatorIndex).trim()
+    def value = line.substring(separatorIndex + 1)
+    if (!(key ==~ /^[A-Za-z_][A-Za-z0-9_]*$/)) {
+      throw new IllegalArgumentException("Environment variable '${key}' on line ${index + 1} is invalid.")
+    }
+
+    merged[key] = value
+  }
+
+  return merged.collect { key, value -> [name: key, value: value] }
+}
+
+def existingServiceChoiceScript = '''
+def region = 'eu-west-2'
+def profile = 'default'
+
+def fallback = ['NO_EXISTING_SERVICES_FOUND']
+
+try {
+  def clusterProc = [
+    'bash',
+    '-lc',
+    "aws ecs list-clusters --profile ${profile} --region ${region} --query 'clusterArns[]' --output text"
+  ].execute()
+  def clusterOut = new StringBuffer()
+  def clusterErr = new StringBuffer()
+  clusterProc.consumeProcessOutput(clusterOut, clusterErr)
+  clusterProc.waitForOrKill(30000)
+
+  if (clusterProc.exitValue() != 0) {
+    def errText = clusterErr.toString().trim()
+    return [errText ? "ERROR_LOADING_SERVICES: ${errText}" : 'ERROR_LOADING_SERVICES']
+  }
+
+  if (!clusterOut?.toString()?.trim()) {
+    return fallback
+  }
+
+  def clusters = clusterOut.toString().split(/\\s+/)
+    .findAll { it }
+    .collect { it.tokenize('/').last() }
+    .findAll { it ==~ /^uat-.+-cluster$/ }
+    .unique()
+
+  if (!clusters) {
+    return fallback
+  }
+
+  def services = []
+  clusters.each { clusterName ->
+    def serviceProc = [
+      'bash',
+      '-lc',
+      "aws ecs list-services --profile ${profile} --cluster '${clusterName}' --region ${region} --query 'serviceArns[]' --output text"
+    ].execute()
+    def serviceOut = new StringBuffer()
+    def serviceErr = new StringBuffer()
+    serviceProc.consumeProcessOutput(serviceOut, serviceErr)
+    serviceProc.waitForOrKill(30000)
+
+    if (serviceProc.exitValue() != 0) {
+      def errText = serviceErr.toString().trim()
+      return [errText ? "ERROR_LOADING_SERVICES: ${errText}" : "ERROR_LOADING_SERVICES_FOR_${clusterName}"]
+    }
+
+    if (serviceOut?.toString()?.trim()) {
+      services.addAll(
+        serviceOut.toString().split(/\\s+/)
+          .findAll { it.contains(':service/') }
+          .collect { it.tokenize('/').last() }
+      )
+    }
+  }
+
+  services = services
+    .findAll { it ==~ /^uat-.+-service$/ }
+    .unique()
+    .sort(false) { a, b -> a.toLowerCase() <=> b.toLowerCase() }
+
+  return services ?: fallback
+} catch (Exception ignored) {
+  return fallback
+}
+'''
+
+def repoChoiceScript = '''
+def region = 'eu-west-2'
+def profile = 'default'
+
+def selectedService = EXISTING_SERVICE?.toString()?.trim()
+def fallback = ['NO_SAVED_REPO_FOUND']
+
+if (!selectedService || !(selectedService ==~ /^uat-.+-service$/)) {
+  return fallback
+}
+
+def depName = selectedService.replaceFirst(/^uat-/, '').replaceFirst(/-service$/, '')
+def clusterName = "uat-${depName}-cluster"
+
+try {
+  def proc = [
+    'bash',
+    '-lc',
+    """
+serviceArn=\\$(aws ecs describe-services \
+  --profile ${profile} \
+  --cluster '${clusterName}' \
+  --services '${selectedService}' \
+  --region ${region} \
+  --query 'services[0].serviceArn' \
+  --output text 2>/dev/null)
+
+if [ -z "\\$serviceArn" ] || [ "\\$serviceArn" = "None" ]; then
+  exit 1
+fi
+
+aws ecs list-tags-for-resource \
+  --profile ${profile} \
+  --resource-arn "\\$serviceArn" \
+  --region ${region} \
+  --query "tags[?key=='BitbucketRepo'].value | [0]" \
+  --output text 2>/dev/null
+"""
+  ].execute()
+
+  def out = new StringBuffer()
+  def err = new StringBuffer()
+  proc.consumeProcessOutput(out, err)
+  proc.waitForOrKill(30000)
+
+  def repo = out.toString().trim()
+  if (proc.exitValue() != 0 || !repo || repo == 'None') {
+    return fallback
+  }
+
+  return [repo]
+} catch (Exception ignored) {
+  return fallback
+}
+'''
+
+def branchChoiceScript = '''
+def repoUrl = Bitbucket_Repo_URI?.toString()?.trim()
+if (!repoUrl || repoUrl == 'NO_SAVED_REPO_FOUND') {
+  return ['main']
+}
+
+def normalized = repoUrl.replaceAll(/\\.git$/, '')
+def sshUrl
+
+if (normalized.startsWith('git@')) {
+  sshUrl = normalized + '.git'
+} else if (normalized.startsWith('https://') && normalized.contains('bitbucket.org/')) {
+  def parts = normalized.split('/').findAll { it }
+  if (parts.size() < 2) {
+    return ['main']
+  }
+
+  def workspace = parts[-2]
+  def repo = parts[-1]
+  sshUrl = "git@bitbucket.org:${workspace}/${repo}.git"
+} else {
+  sshUrl = "git@bitbucket.org:moresand/${normalized}.git"
+}
+
+try {
+  def proc = ['bash', '-lc', "git ls-remote --heads '${sshUrl}'"].execute()
+  def out = new StringBuffer()
+  def err = new StringBuffer()
+  proc.consumeProcessOutput(out, err)
+  proc.waitForOrKill(20000)
+
+  if (proc.exitValue() != 0 || !out?.toString()?.trim()) {
+    return ['main']
+  }
+
+  def branches = out.toString().readLines()
+    .collect { it.tokenize()[1]?.replace('refs/heads/', '') }
+    .findAll { it }
+    .unique()
+    .sort(false) { a, b -> a.toLowerCase() <=> b.toLowerCase() }
+
+  return branches ?: ['main']
+} catch (Exception ignored) {
+  return ['main']
+}
+'''
+
+properties([
+  parameters([
+    choice(name: 'Region', choices: ['eu-west-2'], description: 'AWS region'),
+    [
+      $class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Select the existing ECS service to redeploy.',
+      filterLength: 1,
+      filterable: true,
+      name: 'EXISTING_SERVICE',
+      randomName: 'existing-service-choice-job2',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [
+          classpath: [],
+          sandbox: true,
+          script: "return ['NO_EXISTING_SERVICES_FOUND']"
+        ],
+        script: [
+          classpath: [],
+          sandbox: false,
+          script: existingServiceChoiceScript
+        ]
+      ]
+    ],
+    [
+      $class: 'CascadeChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Auto-loaded Bitbucket repository from the selected ECS service.',
+      filterLength: 1,
+      filterable: false,
+      name: 'Bitbucket_Repo_URI',
+      randomName: 'bitbucket-repo-choice-job2',
+      referencedParameters: 'EXISTING_SERVICE',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [
+          classpath: [],
+          sandbox: true,
+          script: "return ['NO_SAVED_REPO_FOUND']"
+        ],
+        script: [
+          classpath: [],
+          sandbox: false,
+          script: repoChoiceScript
+        ]
+      ]
+    ],
+    [
+      $class: 'CascadeChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Branch dropdown for the selected Bitbucket repository.',
+      filterLength: 1,
+      filterable: true,
+      name: 'CHOSEN_BRANCH',
+      randomName: 'chosen-branch-choice-job2',
+      referencedParameters: 'Bitbucket_Repo_URI',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [
+          classpath: [],
+          sandbox: true,
+          script: "return ['main']"
+        ],
+        script: [
+          classpath: [],
+          sandbox: false,
+          script: branchChoiceScript
+        ]
+      ]
+    ],
+    text(
+      name: 'Environment_Variables',
+      defaultValue: '',
+      description: 'Optional environment variable updates for the existing task definition. Use one KEY=VALUE per line, leave blank to keep current values, and use !KEY to remove an existing variable.'
+    ),
+    [
+  $class: 'CascadeChoiceParameter',
+  choiceType: 'PT_SINGLE_SELECT',
+  description: 'Auto-selected Jenkins agent based on ECS service CPU architecture',
+  name: 'AGENT_LABEL',
+  referencedParameters: 'EXISTING_SERVICE',
+  script: [
+    $class: 'GroovyScript',
+    fallbackScript: [
+      classpath: [],
+      sandbox: true,
+      script: "return ['aws-dynamic-uat-deployment-worker']"
+    ],
+    script: [
+      classpath: [],
+      sandbox: false,
+      script: '''
+import groovy.json.JsonSlurper
+
+def region = 'eu-west-2'
+def profile = 'default'
+def service = EXISTING_SERVICE?.toString()?.trim()
+
+if (!service) {
+    return ['aws-dynamic-uat-deployment-worker']
+}
+
+try {
+
+    // STEP 1: derive cluster
+    def depName = service.replaceFirst(/^uat-/, '').replaceFirst(/-service$/, '')
+    def cluster = "uat-${depName}-cluster"
+
+    // STEP 2: get task definition
+    def taskDefCmd = [
+        "aws",
+        "--profile", profile,
+        "ecs", "describe-services",
+        "--cluster", cluster,
+        "--services", service,
+        "--region", region,
+        "--query", "services[0].taskDefinition",
+        "--output", "text"
+    ]
+
+    def taskDefProc = taskDefCmd.execute()
+    def taskDef = taskDefProc.text?.trim()
+    taskDefProc.waitFor()
+
+    if (!taskDef || taskDef == "None" || taskDefProc.exitValue() != 0) {
+        return ['aws-dynamic-uat-deployment-worker']
+    }
+
+    // STEP 3: get CPU architecture
+    def cpuCmd = [
+        "aws",
+        "--profile", profile,
+        "ecs", "describe-task-definition",
+        "--task-definition", taskDef,
+        "--region", region,
+        "--query", "taskDefinition.runtimePlatform.cpuArchitecture",
+        "--output", "text"
+    ]
+
+    def cpuProc = cpuCmd.execute()
+    def cpu = cpuProc.text?.trim()
+    cpuProc.waitFor()
+
+    // STEP 4: fallback
+    if (!cpu || cpu == "None") {
+        cpu = "X86_64"
+    }
+
+    cpu = cpu.toUpperCase()
+
+    // STEP 5: RETURN AGENT LABEL
+    if (cpu.contains("ARM")) {
+        return ['aws-sandbox-ARM-deployment-worker']
+    }
+
+    return ['aws-dynamic-uat-deployment-worker']
+
+} catch (Exception e) {
+    return ['aws-dynamic-uat-deployment-worker']
+}
+'''
+    ]
+  ]
+]
+  ])
+])
+
+pipeline {
+  agent {
+        label "${params.AGENT_LABEL}"
+  }
+
+  options { timestamps() }
+
+  environment {
+    AWS_REGION         = "${params.Region ?: 'eu-west-2'}"
+    AWS_DEFAULT_REGION = "${params.Region ?: 'eu-west-2'}"
+    AWS_CREDENTIALS_ID = 'London_Region'
+    BITBUCKET_KEY_ID   = 'Bitbucket-key'
+    BASE_DOMAIN        = 'uat.moresand.io'
+  }
+
+  stages {
+    stage('Resolve Service') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def selectedService = (params.EXISTING_SERVICE ?: '').toString().trim()
+            if (!selectedService) {
+              error "EXISTING_SERVICE is required."
+            }
+            if (!(selectedService ==~ /^uat-.+-service$/)) {
+              error "EXISTING_SERVICE must match pattern uat-<name>-service."
+            }
+
+            def selectedBranch = (params.CHOSEN_BRANCH ?: '').toString().trim()
+            if (!selectedBranch) {
+              error "CHOSEN_BRANCH is required."
+            }
+
+            def repoSelection = (params.Bitbucket_Repo_URI ?: '').toString().trim()
+            if (!repoSelection || repoSelection == 'NO_SAVED_REPO_FOUND') {
+              error "Bitbucket_Repo_URI could not be resolved for service ${selectedService}."
+            }
+
+            def rawUrl = repoSelection.replaceAll(/\.git$/, '')
+            def sshRepoUrl
+            if (rawUrl.startsWith('git@')) {
+              sshRepoUrl = "${rawUrl}.git"
+            } else if (rawUrl.startsWith('https://') && rawUrl.contains('bitbucket.org')) {
+              def parts = rawUrl.split('/').findAll { it }
+              sshRepoUrl = "git@bitbucket.org:${parts[-2]}/${parts[-1]}.git"
+            } else {
+              sshRepoUrl = "git@bitbucket.org:moresand/${repoSelection}.git"
+            }
+
+            def depName = selectedService.replaceFirst(/^uat-/, '').replaceFirst(/-service$/, '')
+            env.DEPLOYMENT_NAME = depName
+            env.ECS_SERVICE_NAME = selectedService
+            env.ECS_CLUSTER_NAME = "uat-${depName}-cluster"
+            env.ECR_REPO_NAME = "uat-${depName}"
+            env.OLD_HTTPS_URL = "https://${depName}.${env.BASE_DOMAIN}/"
+            env.RESOLVED_REPO_SELECTION = repoSelection
+            env.RESOLVED_SSH_REPO_URL = sshRepoUrl
+            env.SELECTED_BRANCH = selectedBranch
+
+            def serviceStatus = sh(script: """
+              aws ecs describe-services \
+                --cluster ${env.ECS_CLUSTER_NAME} \
+                --services ${env.ECS_SERVICE_NAME} \
+                --region ${env.AWS_REGION} \
+                --query 'services[0].status' \
+                --output text 2>/dev/null || echo ""
+            """, returnStdout: true).trim()
+
+            if (serviceStatus != 'ACTIVE') {
+              error "Service '${env.ECS_SERVICE_NAME}' not found in cluster '${env.ECS_CLUSTER_NAME}'."
+            }
+
+            env.CURRENT_TASK_DEF_ARN = sh(script: """
+              aws ecs describe-services \
+                --cluster ${env.ECS_CLUSTER_NAME} \
+                --services ${env.ECS_SERVICE_NAME} \
+                --region ${env.AWS_REGION} \
+                --query 'services[0].taskDefinition' \
+                --output text
+            """, returnStdout: true).trim()
+
+            def serviceArn = sh(script: """
+              aws ecs describe-services \
+                --cluster ${env.ECS_CLUSTER_NAME} \
+                --services ${env.ECS_SERVICE_NAME} \
+                --region ${env.AWS_REGION} \
+                --query 'services[0].serviceArn' \
+                --output text
+            """, returnStdout: true).trim()
+
+            env.SAVED_BITBUCKET_BRANCH = sh(script: """
+              aws ecs list-tags-for-resource \
+                --resource-arn ${serviceArn} \
+                --region ${env.AWS_REGION} \
+                --query "tags[?key=='BitbucketBranch'].value | [0]" \
+                --output text 2>/dev/null || echo ""
+            """, returnStdout: true).trim()
+
+            env.TARGET_CONTAINER_NAME = sh(script: """
+              aws ecs describe-services \
+                --cluster ${env.ECS_CLUSTER_NAME} \
+                --services ${env.ECS_SERVICE_NAME} \
+                --region ${env.AWS_REGION} \
+                --query 'services[0].loadBalancers[0].containerName' \
+                --output text 2>/dev/null || echo ""
+            """, returnStdout: true).trim()
+
+            echo "Redeploy target:"
+            echo "  Deployment : ${env.DEPLOYMENT_NAME}"
+            echo "  Cluster    : ${env.ECS_CLUSTER_NAME}"
+            echo "  Service    : ${env.ECS_SERVICE_NAME}"
+            echo "  Task Def   : ${env.CURRENT_TASK_DEF_ARN}"
+            echo "  Saved Repo : ${env.RESOLVED_REPO_SELECTION}"
+            echo "  Saved Branch: ${env.SAVED_BITBUCKET_BRANCH ?: 'N/A'}"
+            echo "  Selected Branch: ${env.SELECTED_BRANCH}"
+            echo "  Old URL    : ${env.OLD_HTTPS_URL}"
+          }
+        }
+      }
+    }
+
+    stage('Install Docker (if required)') {
+      steps {
+        script {
+          sh '''#!/bin/bash
+set -euo pipefail
+
+echo "Checking Docker installation..."
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker not found. Installing Docker..."
+  sudo apt-get update -y
+  sudo apt-get install -y docker.io
+
+  sudo systemctl enable docker
+  sudo systemctl start docker
+else
+  echo "Docker is already installed. Skipping installation."
+fi
+
+echo "Ensuring 'docker' group exists..."
+sudo groupadd docker 2>/dev/null || true
+
+echo "Adding users to 'docker' group..."
+sudo usermod -aG docker jenkins || true
+sudo usermod -aG docker admin || true
+
+echo "Fixing docker socket permissions..."
+sudo chown root:docker /var/run/docker.sock || true
+sudo chmod 666 /var/run/docker.sock || true
+
+echo "Restarting Docker service to apply changes..."
+sudo systemctl restart docker
+
+echo "Verifying Docker access:"
+docker --version || true
+echo "Group membership for 'jenkins':"
+id jenkins || true
+echo "Group membership for 'admin':"
+id admin || true
+
+echo "Docker setup completed successfully."
+'''
+        }
+      }
+    }
+
+    stage('Clone & Build') {
+      steps {
+        withCredentials([sshUserPrivateKey(credentialsId: env.BITBUCKET_KEY_ID, keyFileVariable: 'BITBUCKET_KEY')]) {
+          script {
+            sh """#!/bin/bash
+set -euo pipefail
+rm -rf build
+mkdir -p build
+cd build
+GIT_SSH_COMMAND='ssh -i ${BITBUCKET_KEY} -o StrictHostKeyChecking=no' git clone --branch ${env.SELECTED_BRANCH} ${env.RESOLVED_SSH_REPO_URL} .
+test -f Dockerfile || { echo 'Dockerfile not found'; exit 1; }
+"""
+            env.BUILD_DIR = "${pwd()}/build"
+          }
+        }
+      }
+    }
+
+    stage('Resolve ECR') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def ecrRepo = sh(script: """
+              aws ecr describe-repositories \
+                --repository-names ${env.ECR_REPO_NAME} \
+                --region ${env.AWS_REGION} \
+                --query 'repositories[0].repositoryUri' \
+                --output text 2>/dev/null || echo ""
+            """, returnStdout: true).trim()
+
+            if (!ecrRepo || ecrRepo == 'None') {
+              error "ECR repository '${env.ECR_REPO_NAME}' not found for redeploy."
+            }
+
+            env.ECR_REPO_URI = ecrRepo
+            env.IMAGE_TAG = "redeploy-${env.BUILD_NUMBER}"
+            env.FULL_IMAGE_URI = "${env.ECR_REPO_URI}:${env.IMAGE_TAG}"
+            echo "ECR: ${env.ECR_REPO_URI}"
+          }
+        }
+      }
+    }
+
+    stage('Build & Push Image') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            sh """#!/bin/bash
+set -euo pipefail
+cd ${env.BUILD_DIR}
+ECR_REGISTRY="\$(echo ${env.ECR_REPO_URI} | cut -d'/' -f1)"
+aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin "\$ECR_REGISTRY"
+docker system prune -a -f
+docker build -t ${env.FULL_IMAGE_URI} .
+docker push ${env.FULL_IMAGE_URI}
+docker tag ${env.FULL_IMAGE_URI} ${env.ECR_REPO_URI}:latest
+docker push ${env.ECR_REPO_URI}:latest
+"""
+          }
+        }
+      }
+    }
+
+    stage('Run Trivy Scan') {
+      environment {
+        SLACK_CHANNEL = '#vulnerability-reports-cmb'
+      }
+      steps {
+        script {
+          def buildDir = env.BUILD_DIR
+          def ecrUri = env.ECR_REPO_URI
+          def imageTag = env.IMAGE_TAG
+
+          sh """#!/bin/bash
+set -euo pipefail
+
+cd ${buildDir}
+
+echo "Checking Trivy installation..."
+
+if command -v trivy >/dev/null 2>&1; then
+  echo "Trivy already installed: \$(trivy --version)"
+else
+  echo "Trivy not found. Installing..."
+
+  wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+  echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb \$(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list > /dev/null
+
+  sudo apt-get update -y
+  sudo apt-get install -y trivy jq
+
+  echo "Trivy installed successfully"
+fi
+
+echo "Starting Trivy image scan..."
+
+trivy image --severity MEDIUM,HIGH,CRITICAL --format json --output trivy-report.json ${ecrUri}:${imageTag} || true
+trivy image --severity MEDIUM,HIGH,CRITICAL --format table --output trivy-table.output ${ecrUri}:${imageTag} || true
+
+echo "Processing vulnerability counts..."
+
+MEDIUM=\$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-report.json 2>/dev/null || echo "0")
+HIGH=\$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-report.json 2>/dev/null || echo "0")
+CRITICAL=\$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-report.json 2>/dev/null || echo "0")
+
+cat > trivy_status.env <<EOF
+MEDIUM_COUNT=\$MEDIUM
+HIGH_COUNT=\$HIGH
+CRITICAL_COUNT=\$CRITICAL
+EOF
+
+echo "Trivy scan complete."
+"""
+          archiveArtifacts artifacts: 'build/trivy-table.output,build/trivy_status.env', allowEmptyArchive: true
+
+          def trivyProps = readProperties file: "${buildDir}/trivy_status.env"
+          def MEDIUM = (trivyProps.MEDIUM_COUNT ?: '0').toInteger()
+          def HIGH = (trivyProps.HIGH_COUNT ?: '0').toInteger()
+          def CRITICAL = (trivyProps.CRITICAL_COUNT ?: '0').toInteger()
+
+          wrap([$class: 'BuildUser']) {
+            def buildUser = "${BUILD_USER_ID ?: 'unknown'}"
+            def currentTime = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('UTC'))
+
+            if (MEDIUM > 0 || HIGH > 0 || CRITICAL > 0) {
+              def color = (CRITICAL > 0 || HIGH > 0) ? '#FF0000' : '#36a64f'
+
+              slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: color,
+                message: """*Trivy Scan - ECS Deployment*
+*Time:* ${currentTime} UTC
+*User:* ${buildUser}
+*Deployment:* ${env.DEPLOYMENT_NAME}
+*Image:* ${env.FULL_IMAGE_URI}
+
+*Vulnerabilities:* MEDIUM: ${MEDIUM}, HIGH: ${HIGH}, CRITICAL: ${CRITICAL}
+
+Report: ${env.BUILD_URL}artifact/build/trivy-table.output"""
+              )
+            }
+          }
+        }
+      }
+    }
+
+    stage('Create Task Definition Change Set') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def currentTaskDefJson = sh(script: """
+              aws ecs describe-task-definition \
+                --task-definition ${env.CURRENT_TASK_DEF_ARN} \
+                --region ${env.AWS_REGION} \
+                --output json
+            """, returnStdout: true).trim()
+
+            def full = new JsonSlurperClassic().parseText(currentTaskDefJson)
+            def td = full.taskDefinition ?: [:]
+            def containerDefinitions = ((td.containerDefinitions ?: []) as List).collect { container ->
+              new JsonSlurperClassic().parseText(JsonOutput.toJson(container))
+            }
+
+            def targetName = (env.TARGET_CONTAINER_NAME ?: '').trim()
+            def targetIndex = containerDefinitions.findIndexOf { container ->
+              targetName && container.name?.toString() == targetName
+            }
+            if (targetIndex < 0 && containerDefinitions) {
+              targetIndex = 0
+            }
+
+            if (targetIndex < 0) {
+              error "No container definitions found in task definition ${env.CURRENT_TASK_DEF_ARN}."
+            }
+
+            def targetContainer = containerDefinitions[targetIndex]
+            targetContainer.image = env.FULL_IMAGE_URI
+            targetContainer.environment = mergeEnvironmentVariables(
+              (targetContainer.environment ?: []) as List,
+              params.Environment_Variables
+            )
+
+            def newTaskDef = [
+              family: td.family,
+              taskRoleArn: td.taskRoleArn,
+              executionRoleArn: td.executionRoleArn,
+              networkMode: td.networkMode,
+              containerDefinitions: containerDefinitions,
+              volumes: td.volumes ?: [],
+              placementConstraints: td.placementConstraints ?: [],
+              requiresCompatibilities: td.requiresCompatibilities ?: [],
+              cpu: td.cpu,
+              memory: td.memory,
+              pidMode: td.pidMode,
+              ipcMode: td.ipcMode,
+              proxyConfiguration: td.proxyConfiguration,
+              inferenceAccelerators: td.inferenceAccelerators ?: [],
+              ephemeralStorage: td.ephemeralStorage,
+              runtimePlatform: td.runtimePlatform
+            ].findAll { key, value -> value != null }
+
+            writeFile file: 'task-definition-updated.json', text: JsonOutput.prettyPrint(JsonOutput.toJson(newTaskDef))
+
+            env.NEW_TASK_DEF_ARN = sh(script: """
+              aws ecs register-task-definition \
+                --cli-input-json file://task-definition-updated.json \
+                --region ${env.AWS_REGION} \
+                --query 'taskDefinition.taskDefinitionArn' \
+                --output text
+            """, returnStdout: true).trim()
+
+            echo "Task definition change set created: ${env.NEW_TASK_DEF_ARN}"
+          }
+        }
+      }
+    }
+
+    stage('Apply Change Set / Rollout') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          sh """#!/bin/bash
+set -euo pipefail
+aws ecs update-service \
+  --cluster ${env.ECS_CLUSTER_NAME} \
+  --service ${env.ECS_SERVICE_NAME} \
+  --task-definition ${env.NEW_TASK_DEF_ARN} \
+  --force-new-deployment \
+  --region ${env.AWS_REGION}
+"""
+        }
+      }
+    }
+
+    stage('Wait for Stability') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          timeout(time: 10, unit: 'MINUTES') {
+            sh """#!/bin/bash
+set -euo pipefail
+aws ecs wait services-stable \
+  --cluster ${env.ECS_CLUSTER_NAME} \
+  --services ${env.ECS_SERVICE_NAME} \
+  --region ${env.AWS_REGION}
+"""
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo """
+========================================
+ECS REDEPLOYMENT SUCCESSFUL
+========================================
+Deployment Name : ${env.DEPLOYMENT_NAME}
+Cluster         : ${env.ECS_CLUSTER_NAME}
+Service         : ${env.ECS_SERVICE_NAME}
+Old Task Def    : ${env.CURRENT_TASK_DEF_ARN}
+New Task Def    : ${env.NEW_TASK_DEF_ARN}
+Image           : ${env.FULL_IMAGE_URI}
+Old URL         : ${env.OLD_HTTPS_URL ?: 'N/A'}
+========================================
+"""
+    }
+    failure {
+      echo "ECS redeployment failed"
+    }
+  }
+}
