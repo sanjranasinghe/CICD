@@ -1,0 +1,1704 @@
+import groovy.json.JsonOutput
+
+def mergeEnvironmentVariables(List baseVars, String overridesText) {
+  def merged = new LinkedHashMap<String, String>()
+
+  (baseVars ?: []).each { entry ->
+    if (entry?.name != null) {
+      merged[entry.name.toString()] = entry.value == null ? '' : entry.value.toString()
+    }
+  }
+
+  overridesText?.readLines()?.eachWithIndex { rawLine, index ->
+    def line = (rawLine ?: '').trim()
+    if (!line || line.startsWith('#')) {
+      return
+    }
+
+    if (line.startsWith('!')) {
+      def keyToRemove = line.substring(1).trim()
+      if (!keyToRemove) {
+        throw new IllegalArgumentException("Environment_Variables line ${index + 1} has an invalid remove instruction.")
+      }
+      merged.remove(keyToRemove)
+      return
+    }
+
+    int separatorIndex = line.indexOf('=')
+    if (separatorIndex <= 0) {
+      throw new IllegalArgumentException("Environment_Variables line ${index + 1} must use KEY=VALUE format.")
+    }
+
+    def key = line.substring(0, separatorIndex).trim()
+    def value = line.substring(separatorIndex + 1)
+    if (!(key ==~ /^[A-Za-z_][A-Za-z0-9_]*$/)) {
+      throw new IllegalArgumentException("Environment variable '${key}' on line ${index + 1} is invalid.")
+    }
+
+    merged[key] = value
+  }
+
+  return merged.collect { key, value -> [name: key, value: value] }
+}
+
+// def repoChoiceScript = '''
+// import com.cloudbees.plugins.credentials.CredentialsProvider
+// import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials
+// import groovy.json.JsonSlurperClassic
+// import jenkins.model.Jenkins
+// import java.util.Base64
+
+// def workspace = 'moresand'
+// def credentialId = 'Bitbucket-HTTP'
+
+// try {
+//   def creds = CredentialsProvider.lookupCredentials(
+//     StandardUsernamePasswordCredentials.class,
+//     Jenkins.get(),
+//     null,
+//     null
+//   ).find { it.id == credentialId }
+
+//   if (!creds) {
+//     return ['NO_BITBUCKET_CREDENTIAL']
+//   }
+
+//   def username = creds.username
+//   def password = creds.password.getPlainText()
+//   def auth = Base64.encoder.encodeToString("${username}:${password}".getBytes('UTF-8'))
+//   def repos = []
+//   def nextUrl = "https://api.bitbucket.org/2.0/repositories/${workspace}?pagelen=100"
+
+//   while (nextUrl != null && nextUrl.toString().trim()) {
+//     def conn = new URL(nextUrl).openConnection()
+//     conn.setRequestProperty('Authorization', "Basic ${auth}")
+//     conn.setRequestProperty('Accept', 'application/json')
+//     conn.setConnectTimeout(15000)
+//     conn.setReadTimeout(15000)
+
+//     def code = conn.getResponseCode()
+//     if (code != 200) {
+//       return ["API_ERROR_${code}"]
+//     }
+
+//     def payload = new JsonSlurperClassic().parseText(
+//       conn.getInputStream().getText('UTF-8')
+//     )
+
+//     def values = payload['values'] ?: []
+//     values.each { repo ->
+//       def repoName = repo['name']
+//       if (repoName) {
+//         repos << repoName.toString()
+//       }
+//     }
+
+//     nextUrl = payload['next'] ? payload['next'].toString() : null
+//   }
+
+//   def choices = repos
+//     .findAll { it != null && it.toString().trim() }
+//     .unique()
+//     .sort(false) { a, b -> a.toLowerCase() <=> b.toLowerCase() }
+
+//   def searchTerm = (REPO_SEARCH ?: '').toString().trim().toLowerCase()
+//   if (!searchTerm) {
+//     return ['Type at least 3 letters in REPO_SEARCH']
+//   }
+//   if (searchTerm.length() < 3) {
+//     return ['Type at least 3 letters in REPO_SEARCH']
+//   }
+
+//   def filteredChoices = choices.findAll { it.toLowerCase().contains(searchTerm) }
+//   return filteredChoices ? (['-- Select repository --'] + filteredChoices) : ['NO_MATCHING_REPOSITORIES']
+// } catch (Throwable e) {
+//   return ["ERROR_${e.class.simpleName}"]
+// }
+// '''
+
+// def branchChoiceScript = '''
+// def repoName = Bitbucket_Repo_URI?.toString()?.trim()
+// if (!repoName || repoName == '-- Select repository --' || repoName.startsWith('NO_') || repoName.startsWith('API_ERROR_') || repoName.startsWith('ERROR_')) {
+//   return ['main']
+// }
+
+// def sshUrl = "git@bitbucket.org:moresand/${repoName}.git"
+
+// def proc = ['bash', '-lc', "git ls-remote --heads '${sshUrl}'"].execute()
+// def out = new StringBuffer()
+// def err = new StringBuffer()
+// proc.consumeProcessOutput(out, err)
+// proc.waitForOrKill(15000)
+
+// if (proc.exitValue() != 0 || !out) {
+//   return ['main']
+// }
+
+// def branches = out.toString().readLines()
+//   .collect { it.tokenize()[1]?.replace('refs/heads/', '') }
+//   .findAll { it }
+//   .unique()
+//   .sort(false) { a, b -> a.toLowerCase() <=> b.toLowerCase() }
+
+// return branches ?: ['main']
+// '''
+
+def repoChoiceScript = '''
+import com.cloudbees.plugins.credentials.CredentialsProvider
+import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials
+import groovy.json.JsonSlurperClassic
+import jenkins.model.Jenkins
+import java.util.Base64
+def workspace = 'moresand'
+def credentialId = 'thilak-api'
+try {
+  def creds = CredentialsProvider.lookupCredentials(
+    StandardUsernamePasswordCredentials.class,
+    Jenkins.get(),
+    null,
+    null
+  ).find { it.id == credentialId }
+  if (!creds) {
+    return ['NO_BITBUCKET_CREDENTIAL']
+  }
+  def username = creds.username
+  def password = creds.password.getPlainText()
+  def auth = Base64.encoder.encodeToString("${username}:${password}".getBytes('UTF-8'))
+  def repos = []
+  def nextUrl = "https://api.bitbucket.org/2.0/repositories/${workspace}?pagelen=100"
+  while (nextUrl != null && nextUrl.toString().trim()) {
+    def conn = new URL(nextUrl).openConnection()
+    conn.setRequestProperty('Authorization', "Basic ${auth}")
+    conn.setRequestProperty('Accept', 'application/json')
+    conn.setConnectTimeout(15000)
+    conn.setReadTimeout(15000)
+    def code = conn.getResponseCode()
+    if (code != 200) {
+      return ["API_ERROR_${code}".toString()]
+    }
+    def payload = new JsonSlurperClassic().parseText(
+      conn.getInputStream().getText('UTF-8')
+    )
+    def values = payload['values'] ?: []
+    values.each { repo ->
+      def repoName = repo['name']
+      if (repoName) {
+        repos << repoName.toString()
+      }
+    }
+    nextUrl = payload['next'] ? payload['next'].toString() : null
+  }
+  def choices = repos
+    .findAll { it != null && it.toString().trim() }
+    .unique()
+    .sort(false) { a, b -> a.toLowerCase() <=> b.toLowerCase() }
+  def searchTerm = (REPO_SEARCH ?: '').toString().trim().toLowerCase()
+  if (!searchTerm) {
+    return ['Type at least 3 letters in REPO_SEARCH']
+  }
+  if (searchTerm.length() < 3) {
+    return ['Type at least 3 letters in REPO_SEARCH']
+  }
+  def filteredChoices = choices.findAll { it.toLowerCase().contains(searchTerm) }
+  return filteredChoices ? (['-- Select repository --'] + filteredChoices) : ['NO_MATCHING_REPOSITORIES']
+} catch (Throwable e) {
+  return ["ERROR_${e.class.simpleName}: ${e.message}".toString()]
+}
+'''
+def branchChoiceScript = '''
+def repoName = Bitbucket_Repo_URI?.toString()?.trim()
+if (!repoName || repoName == '-- Select repository --' || repoName.startsWith('NO_') || repoName.startsWith('API_ERROR_') || repoName.startsWith('ERROR_')) {
+  return ['main']
+}
+def sshUrl = "git@bitbucket.org:moresand/${repoName}.git"
+def proc = ['bash', '-lc', "git ls-remote --heads '${sshUrl}'"].execute()
+def out = new StringBuffer()
+def err = new StringBuffer()
+proc.consumeProcessOutput(out, err)
+proc.waitForOrKill(15000)
+if (proc.exitValue() != 0 || !out) {
+  return ['main']
+}
+def branches = out.toString().readLines()
+  .collect { it.tokenize()[1]?.replace('refs/heads/', '') }
+  .findAll { it }
+  .unique()
+  .sort(false) { a, b -> a.toLowerCase() <=> b.toLowerCase() }
+return branches ?: ['main']
+'''
+
+
+properties([
+  parameters([
+    string(name: 'Deployment_Name', defaultValue: '', description: 'Deployment name (e.g., tcuk/waf/mabuhay) - no spaces'),
+    string(name: 'Deployment_Port', defaultValue: '8080', description: 'Container port to expose (default: 8080)'),
+  //  choice(name: 'Deployment_Type', choices: ['Web-or-API', 'Worker'], description: 'Choose deployment type: Web/API includes ALB, Worker runs ECS only'),
+    choice(
+    name: 'Deployment_Type',choices: ['Web-or-API', 'Worker'], description: '''Select the deployment type:
+    - Web-or-API : Deploys ECS service WITH HTTPs - use for frontend/backend APIs that need HTTP/HTTPS traffic
+    - Worker     : Deploys ECS service ONLY - use for background jobs, queue processors, or scheduled tasks'''),
+    choice(name: 'CPU_ARCH',choices: ['X86_64', 'ARM64'],description: 'CPU Architecture (x86 or ARM)'),
+    choice(name: 'CPU', choices: ['256', '512', '1024', '2048', '4096'], description: 'CPU units for Fargate task'),
+    choice(name: 'Memory', choices: ['512', '1024', '2048', '3072', '4096', '8192'], description: 'Memory (MiB) for Fargate task'),
+    string(name: 'Desired_Count', defaultValue: '1', description: 'Number of tasks to run'),
+    booleanParam(name: 'MULTI_AZ',defaultValue: false, description: 'Enable Multi-AZ deployment (uses multiple subnets across AZs)'),
+    string(name: 'CONTAINER_COMMAND',defaultValue: '',description: 'Optional container command (comma-separated, e.g. lh-ndc,run,worker1 or python,app.py,--env,uat)'),
+    choice(name: 'Region', choices: ['eu-west-2'], description: 'AWS region'),
+    string(name: 'Tag_Name', defaultValue: 'uat', description: 'Environment tag'),
+    choice(name: 'AUTO_DELETE', choices: ['false', 'true'], description: 'Auto-delete resources after TTL?'),
+    string(name: 'AUTO_DELETE_HOURS', defaultValue: '24', description: 'Hours until auto-delete if enabled'),
+    text(
+      name: 'Environment_Variables',
+      defaultValue: '',
+      description: 'Optional task-definition environment variables. Use one KEY=VALUE per line. Use !KEY to remove a default entry before deployment.'
+    ),
+    string(name: 'REPO_SEARCH', defaultValue: '', description: 'Type at least 3 letters of the repository name to search'),
+    [
+      $class: 'CascadeChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Matching Bitbucket repositories for the entered search text.',
+      filterLength: 1,
+      filterable: false,
+      name: 'Bitbucket_Repo_URI',
+      randomName: 'bitbucket-repo-choice',
+      referencedParameters: 'REPO_SEARCH',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [
+          classpath: [],
+          sandbox: true,
+          script: "return ['NO_REPOSITORIES_FOUND']"
+        ],
+        script: [
+          classpath: [],
+          sandbox: false,
+          script: repoChoiceScript
+        ]
+      ]
+    ],
+    [
+      $class: 'CascadeChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Branch to deploy. Type 3 or more letters to search the branch list.',
+      filterLength: 3,
+      filterable: true,
+      name: 'CHOSEN_BRANCH',
+      randomName: 'chosen-branch-filter',
+      referencedParameters: 'Bitbucket_Repo_URI',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [
+          classpath: [],
+          sandbox: true,
+          script: "return ['main']"
+        ],
+        script: [
+          classpath: [],
+          sandbox: false,
+          script: branchChoiceScript
+        ]
+      ]
+    ],
+    [
+  $class: 'CascadeChoiceParameter',
+  choiceType: 'PT_SINGLE_SELECT',
+  description: 'Auto-selected Jenkins agent based on CPU architecture',
+  name: 'AGENT_LABEL',
+  referencedParameters: 'CPU_ARCH',
+  script: [
+    $class: 'GroovyScript',
+    fallbackScript: [
+      classpath: [],
+      sandbox: true,
+      script: "return ['aws-dynamic-uat-deployment-worker']"
+    ],
+    script: [
+      classpath: [],
+      sandbox: true,
+      script: '''
+def arch = CPU_ARCH?.toString()?.trim()
+
+if (!arch) {
+    return ['aws-dynamic-uat-deployment-worker']
+}
+
+if (arch == 'ARM64') {
+    return ['aws-sandbox-ARM-deployment-worker']
+} else {
+    return ['aws-dynamic-uat-deployment-worker']
+}
+'''
+    ]
+  ]
+]
+  ])
+])
+
+def getJenkinsUsername() {
+  def causes = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
+  return causes?.size() > 0 ? causes[0].userId : 'unknown'
+}
+
+pipeline {
+ agent {
+        label "${params.AGENT_LABEL}"
+  }
+  options { timestamps() }
+
+  environment {
+    AWS_REGION         = 'eu-west-2'
+    AWS_DEFAULT_REGION = 'eu-west-2'
+    ALB_ARN            = 'arn:aws:elasticloadbalancing:eu-west-2:715451173743:loadbalancer/app/Sandbox-Dynamic-UAT-LB/f019785ce5474a92'
+  //  ALB_ARN            = 'arn:aws:elasticloadbalancing:eu-west-2:715451173743:loadbalancer/app/flight-Dynam-D32IqILRXuq8/3f08434dcad62efb'
+    HEALTHCHECK_PATH   = '/dev/health'
+    BASE_DOMAIN        = 'uat.moresand.io'
+    PUBLIC_HOSTED_ZONE_ID = 'Z1022656K7AKO21GKF5F'
+    AWS_CREDENTIALS_ID = 'London_Region'
+    GIT_CREDENTIALS_ID = 'Bitbucket'
+   // SUBNET_ID          = 'subnet-02d808ca7a99b4b16'
+    SUBNET_IDS = 'subnet-02d808ca7a99b4b16,subnet-08028a5311f712c7d'
+    SG_ID              = 'sg-04db278d078ae8694'
+  //  SG_ID              = 'sg-022655094f94e99ac'
+    VPC_ID             = 'vpc-02a95c188b5bf9387'
+    ECS_EXECUTION_ROLE_ARN = 'arn:aws:iam::715451173743:role/ecsTaskExecutionRole'
+    ECR_LIFECYCLE_POLICY = '''{
+      "rules": [
+        {
+          "rulePriority": 1,
+          "description": "Keep last 10 images",
+          "selection": {
+            "tagStatus": "any",
+            "countType": "imageCountMoreThan",
+            "countNumber": 10
+          },
+          "action": { "type": "expire" }
+        }
+      ]
+    }'''
+  }
+
+  stages {
+
+    stage('Prepare Branch') {
+      steps {
+        script {
+          def chosen = (params.CHOSEN_BRANCH ?: '').toString().trim()
+          if (!chosen) { chosen = 'main' }
+          env.CHOSEN_BRANCH = chosen
+          echo "Branch: ${env.CHOSEN_BRANCH}"
+        }
+      }
+    }
+    
+   stage('Init & Validate') {
+      steps {
+        script {
+          def depRaw = (params.Deployment_Name ?: '').toString().trim()
+          if (!depRaw) {
+            def base = (env.JOB_NAME ?: 'deploy').replaceAll('[^A-Za-z0-9-]', '-').toLowerCase()
+            depRaw = "${base}-${env.BUILD_NUMBER ?: '0'}"
+          }
+          depRaw = depRaw.replaceAll('\\s+', '-')
+            .replaceAll('[^A-Za-z0-9-]', '-')
+            .replaceAll('-+', '-')
+            .toLowerCase()
+            .take(63)
+            .replaceAll('^-+', '')
+            .replaceAll('-+$', '')
+          if (!depRaw) {
+            error 'Deployment_Name resolves to an invalid value for ECR naming. Please use letters or numbers.'
+          }
+          def repoSelection = (params.Bitbucket_Repo_URI ?: '').toString().trim()
+          env.DEPLOYMENT_NAME = depRaw
+          env.ECR_REPO_NAME = "uat-${depRaw}"
+          env.ECS_CLUSTER_NAME = "uat-${depRaw}-cluster"
+          env.ECS_SERVICE_NAME = "uat-${depRaw}-service"
+          env.ECS_TASK_FAMILY = "uat-${depRaw}-task"
+          env.DEPLOYMENT_PORT = (params.Deployment_Port ?: '8080').toString().trim()
+          env.CPU_VALUE = params.CPU ?: '256'
+          env.MEMORY_VALUE = params.Memory ?: '512'
+          env.DESIRED_COUNT = (params.Desired_Count ?: '2').toString().trim()
+          env.TAG_NAME = params.Tag_Name ?: 'uat'
+          env.SELECTED_BITBUCKET_REPO = repoSelection
+          env.SELECTED_BITBUCKET_BRANCH = env.CHOSEN_BRANCH ?: 'main'
+
+          // =========================
+          // COST ALLOCATION TAG (added)
+          // =========================
+          //env.COST_CENTER_TAG = env.DEPLOYMENT_NAME
+          
+          // =========================
+            // COST ALLOCATION TAG (added)
+            // =========================
+            def deployedByUser = getJenkinsUsername()
+              .toString()
+              .replaceAll('[^A-Za-z0-9-]', '-')
+              .replaceAll('-+', '-')
+              .toLowerCase()
+            env.COST_CENTER_TAG = "${env.DEPLOYMENT_NAME}-${deployedByUser}"
+
+          // =========================
+          // CPU ARCHITECTURE
+          // =========================
+          env.CPU_ARCH = params.CPU_ARCH ?: 'X86_64'
+          // =========================
+          // STRICT AGENT SELECTION
+          // =========================
+          if (env.CPU_ARCH == 'ARM64') {
+            env.BUILD_AGENT_LABEL = 'aws-sandbox-ARM-deployment-worker'
+          } else {
+            env.BUILD_AGENT_LABEL = 'aws-dynamic-uat-deployment-worker'
+          }
+          // =========================
+          // STRICT FLUENT BIT IMAGE SELECTION
+          // =========================
+          if (env.CPU_ARCH == 'ARM64') {
+            env.FLUENT_IMAGE = "116981806488.dkr.ecr.eu-west-2.amazonaws.com/fluent-bit_ecr:latest"
+          } else {
+            env.FLUENT_IMAGE = "116981806488.dkr.ecr.eu-west-2.amazonaws.com/fluent-bit_ecr:latest-x86"
+          }
+          // =========================
+          // DISPLAY NAME
+          // =========================
+          currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.DEPLOYMENT_NAME} (${env.CPU_ARCH})"
+          // =========================
+          // LOGGING
+          // =========================
+          echo "========================================"
+          echo "Deployment Name : ${env.DEPLOYMENT_NAME}"
+          echo "Cluster Name    : ${env.ECS_CLUSTER_NAME}"
+          echo "CPU / Memory    : ${env.CPU_VALUE} / ${env.MEMORY_VALUE}"
+          echo "Architecture    : ${env.CPU_ARCH}"
+          echo "Agent Label     : ${env.BUILD_AGENT_LABEL}"
+          echo "Fluent Image    : ${env.FLUENT_IMAGE}"
+          echo "Cost Center Tag : ${env.COST_CENTER_TAG}"
+          echo "========================================"
+
+          // =========================
+          // VALIDATION
+          // =========================
+          if (!(params.Bitbucket_Repo_URI ?: '').toString().trim()) {
+            error 'Bitbucket_Repo_URI is required'
+          }
+          // =========================
+          // MULTI-AZ LOGIC
+          // =========================
+          if (params.MULTI_AZ) {
+            env.SUBNET_LIST = env.SUBNET_IDS
+            echo "Multi-AZ ENABLED -> Using subnets: ${env.SUBNET_LIST}"
+          } else {
+            env.SUBNET_LIST = env.SUBNET_IDS.split(',')[0]
+            echo "Single-AZ mode -> Using subnet: ${env.SUBNET_LIST}"
+          }
+          if (params.MULTI_AZ && env.DESIRED_COUNT.toInteger() < 2) {
+            env.DESIRED_COUNT = "2"
+            echo "Increased Desired Count to 2 for high availability"
+          }
+          if (params.MULTI_AZ && env.SUBNET_IDS.split(',').size() < 2) {
+            error "MULTI_AZ enabled but less than 2 subnets provided"
+          }
+
+          // =========================
+          // SAFETY CHECK
+          // =========================
+          if (env.CPU_ARCH == 'ARM64') {
+            echo "Ensure ARM64 compatibility for Docker image or use multi-arch buildx"
+          }
+          // -----------------------------
+          // Container command support
+          // -----------------------------
+          def cmdRaw = (params.CONTAINER_COMMAND ?: '').toString().trim()
+          if (cmdRaw) {
+            def cmdList = cmdRaw
+              .split(',')
+              .collect { it.trim() }
+              .findAll { it }
+            env.CONTAINER_COMMAND_JSON = groovy.json.JsonOutput.toJson(cmdList)
+            echo "Container command set: ${env.CONTAINER_COMMAND_JSON}"
+          } else {
+            env.CONTAINER_COMMAND_JSON = '[]'
+            echo "No container command provided (default ENTRYPOINT will be used)"
+          }
+
+          currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.DEPLOYMENT_NAME} (ECS)"
+          echo "Deployment: ${env.DEPLOYMENT_NAME}"
+          echo "Cluster: ${env.ECS_CLUSTER_NAME}"
+
+          env.DEPLOYMENT_TYPE = params.Deployment_Type ?: 'Web-or-API'
+          echo "Deployment Type: ${env.DEPLOYMENT_TYPE}"
+
+          def isWorker = (env.DEPLOYMENT_TYPE == 'Worker')
+          env.IS_WORKER = isWorker.toString()
+
+          if (!repoSelection) {
+            error 'Bitbucket_Repo_URI is required'
+          }
+          if (repoSelection == '-- Select repository --' || repoSelection == 'Type at least 3 letters in REPO_SEARCH' || repoSelection.startsWith('NO_') || repoSelection.startsWith('API_ERROR_') || repoSelection.startsWith('ERROR_')) {
+            error "Bitbucket_Repo_URI is invalid: ${repoSelection}"
+          }
+        }
+      }
+    }
+    
+    
+stage('Install Docker (if required)') {
+  steps {
+    script {
+      sh '''#!/bin/bash
+set -euo pipefail
+
+echo "Checking Docker installation..."
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker not found. Installing Docker..."
+  sudo apt-get update -y
+  sudo apt-get install -y docker.io
+
+  sudo systemctl enable docker
+  sudo systemctl start docker
+else
+  echo "Docker is already installed. Skipping installation."
+fi
+
+echo "Ensuring 'docker' group exists..."
+sudo groupadd docker 2>/dev/null || true
+
+echo "Adding users to 'docker' group..."
+sudo usermod -aG docker jenkins || true
+sudo usermod -aG docker admin || true
+
+echo "Fixing docker socket permissions..."
+sudo chown root:docker /var/run/docker.sock || true
+sudo chmod 666 /var/run/docker.sock || true
+
+echo "Restarting Docker service to apply changes..."
+sudo systemctl restart docker
+
+echo "Verifying Docker access:"
+docker --version || true
+echo "Group membership for 'jenkins':"
+id jenkins || true
+echo "Group membership for 'admin':"
+id admin || true
+
+echo "Docker setup completed successfully."
+'''
+    }
+  }
+}
+
+    stage('Clone & Build Locally') {
+      steps {
+        withCredentials([
+          sshUserPrivateKey(credentialsId: 'Bitbucket-key', keyFileVariable: 'BITBUCKET_KEY'),
+          sshUserPrivateKey(credentialsId: 'SSH-London', keyFileVariable: 'SSH_KEY_FILE')
+        ]) {
+          script {
+            def branch = env.CHOSEN_BRANCH ?: 'main'
+            def repoSelection = (params.Bitbucket_Repo_URI ?: '').toString().trim()
+            def rawUrl = repoSelection.replaceAll(/\.git$/, '')
+            def sshRepoUrl = null
+
+            if (rawUrl.startsWith('git@')) {
+              sshRepoUrl = "${rawUrl}.git"
+            } else if (rawUrl.startsWith('https://') && rawUrl.contains('bitbucket.org')) {
+              def parts = rawUrl.split('/')
+              sshRepoUrl = "git@bitbucket.org:${parts[-2]}/${parts[-1]}.git"
+            } else if (repoSelection && !(repoSelection == '-- Select repository --' || repoSelection == 'Type at least 3 letters in REPO_SEARCH' || repoSelection.startsWith('NO_') || repoSelection.startsWith('API_ERROR_') || repoSelection.startsWith('ERROR_'))) {
+              sshRepoUrl = "git@bitbucket.org:moresand/${repoSelection}.git"
+            }
+
+            if (!sshRepoUrl) {
+              error "Unable to resolve Bitbucket_Repo_URI '${repoSelection}' into a clone URL."
+            }
+
+            sh """#!/bin/bash
+set -euo pipefail
+rm -rf build && mkdir -p build
+cd build
+GIT_SSH_COMMAND='ssh -i ${BITBUCKET_KEY} -o StrictHostKeyChecking=no' git clone --branch ${branch} ${sshRepoUrl} .
+test -f Dockerfile || { echo 'Dockerfile not found'; exit 1; }
+"""
+            env.BUILD_DIR = "${pwd()}/build"
+          }
+        }
+      }
+    }
+    
+//     stage('Prepare AWS Directory in Cloned Repo') {
+//   when {
+//     expression { return params.USE_SECRETS_MANAGER == true }
+//   }
+//   steps {
+//     withCredentials([
+//       file(credentialsId: 'aws-credentials-file', variable: 'AWS_CREDENTIALS_FILE'),
+//       file(credentialsId: 'aws-config-file', variable: 'AWS_CONFIG_FILE')
+//     ]) {
+//       script {
+//         def buildDir = env.BUILD_DIR
+
+//         sh """#!/bin/bash
+// set -euo pipefail
+
+// echo "🔐 Secrets Manager enabled — preparing aws directory..."
+
+// cd ${buildDir}
+
+// # Check if aws directory exists
+// if [ ! -d "aws" ]; then
+//   echo "aws directory does not exist. Creating..."
+//   mkdir aws
+// else
+//   echo "aws directory already exists."
+// fi
+
+// # Copy credentials and config
+// cp "$AWS_CREDENTIALS_FILE" aws/credentials
+// cp "$AWS_CONFIG_FILE" aws/config
+
+// # Set full permissions (read/write/execute for all)
+// chmod -R 777 aws
+
+// echo "✅ AWS directory prepared inside cloned repository"
+// """
+//       }
+//     }
+//   }
+// }
+
+    stage('Create ECR Repository') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def ecrRepo = sh(script: """
+              aws ecr describe-repositories --repository-names ${env.ECR_REPO_NAME} --region ${env.AWS_REGION} --query 'repositories[0].repositoryUri' --output text 2>/dev/null || echo ""
+            """, returnStdout: true).trim()
+
+            if (!ecrRepo || ecrRepo == 'None') {
+              ecrRepo = sh(script: """
+                aws ecr create-repository \
+                  --repository-name ${env.ECR_REPO_NAME} \
+                  --image-scanning-configuration scanOnPush=true \
+                  --encryption-configuration encryptionType=AES256 \
+                  --tags Key=costCenter,Value=${env.COST_CENTER_TAG} Key=DeploymentName,Value=${env.DEPLOYMENT_NAME} Key=ENV,Value=${env.TAG_NAME} \
+                  --region ${env.AWS_REGION} \
+                  --query 'repository.repositoryUri' --output text
+              """, returnStdout: true).trim()
+
+              sh """#!/bin/bash
+                aws ecr put-lifecycle-policy \
+                  --repository-name ${env.ECR_REPO_NAME} \
+                  --lifecycle-policy-text '${env.ECR_LIFECYCLE_POLICY}' \
+                  --region ${env.AWS_REGION} || true
+              """
+            }
+            env.ECR_REPO_URI = ecrRepo
+            echo "ECR Repository: ${env.ECR_REPO_URI}"
+          }
+        }
+      }
+    }
+
+    stage('Build & Push to ECR') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def buildDir = env.BUILD_DIR
+            def ecrUri = env.ECR_REPO_URI
+            def imageTag = "build-${env.BUILD_NUMBER}"
+
+            sh """#!/bin/bash
+set -euo pipefail
+cd ${buildDir}
+
+ECR_REGISTRY="\$(echo ${ecrUri} | cut -d'/' -f1)"
+aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin "\$ECR_REGISTRY"
+docker system prune -a -f
+docker build --build-arg ENV=UAT -t ${ecrUri}:${imageTag} .
+docker push ${ecrUri}:${imageTag}
+docker tag ${ecrUri}:${imageTag} ${ecrUri}:latest
+docker push ${ecrUri}:latest
+"""
+            env.IMAGE_TAG = imageTag
+            env.FULL_IMAGE_URI = "${ecrUri}:${imageTag}"
+          }
+        }
+      }
+    }
+
+
+stage('Run Trivy Scan') {
+  environment {
+    SLACK_CHANNEL = '#vulnerability-reports-cmbs'
+  }
+  steps {
+    script {
+      def buildDir = env.BUILD_DIR
+      def ecrUri = env.ECR_REPO_URI
+      def imageTag = env.IMAGE_TAG
+
+      sh """#!/bin/bash
+set -euo pipefail
+cd ${buildDir}
+
+echo "Preparing system (fix dpkg if needed)..."
+sudo dpkg --configure -a || true
+
+echo "Ensuring required tools..."
+if ! command -v trivy >/dev/null 2>&1; then
+  echo "Installing Trivy..."
+
+  # Fix Jenkins repo GPG issue (prevents apt update failure)
+  sudo mkdir -p /usr/share/keyrings
+  if [ ! -f /usr/share/keyrings/jenkins-keyring.asc ]; then
+    wget -qO - https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | \
+      sudo tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+  fi
+
+  # Add Trivy repo
+  wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | \
+    gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+
+  echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb \$(lsb_release -sc) main" | \
+    sudo tee /etc/apt/sources.list.d/trivy.list > /dev/null
+
+  sudo apt-get update -y
+  sudo apt-get install -y trivy jq
+fi
+
+echo "Running Trivy scan..."
+trivy image --severity MEDIUM,HIGH,CRITICAL --format json \
+  --output trivy-report.json ${ecrUri}:${imageTag} || true
+
+trivy image --severity MEDIUM,HIGH,CRITICAL --format table \
+  --output trivy-table.output ${ecrUri}:${imageTag} || true
+
+echo "Parsing results..."
+MEDIUM=\$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-report.json 2>/dev/null || echo "0")
+HIGH=\$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-report.json 2>/dev/null || echo "0")
+CRITICAL=\$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-report.json 2>/dev/null || echo "0")
+
+cat > trivy_status.env <<EOF
+MEDIUM_COUNT=\$MEDIUM
+HIGH_COUNT=\$HIGH
+CRITICAL_COUNT=\$CRITICAL
+EOF
+"""
+
+      archiveArtifacts artifacts: 'build/trivy-table.output,build/trivy_status.env', allowEmptyArchive: true
+
+      def trivyProps = readProperties file: "${buildDir}/trivy_status.env"
+      def MEDIUM = (trivyProps.MEDIUM_COUNT ?: '0').toInteger()
+      def HIGH = (trivyProps.HIGH_COUNT ?: '0').toInteger()
+      def CRITICAL = (trivyProps.CRITICAL_COUNT ?: '0').toInteger()
+
+      wrap([$class: 'BuildUser']) {
+        def buildUser = "${BUILD_USER_ID ?: 'unknown'}"
+        def currentTime = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('UTC'))
+
+        if (MEDIUM > 0 || HIGH > 0 || CRITICAL > 0) {
+          def color = (CRITICAL > 0 || HIGH > 0) ? '#FF0000' : '#36a64f'
+
+          slackSend(
+            channel: env.SLACK_CHANNEL,
+            color: color,
+            message: """*Trivy Scan - ECS Deployment*
+*Time:* ${currentTime} UTC
+*User:* ${buildUser}
+*Deployment:* ${env.DEPLOYMENT_NAME}
+*Image:* ${env.FULL_IMAGE_URI}
+
+*Vulnerabilities:* MEDIUM: ${MEDIUM}, HIGH: ${HIGH}, CRITICAL: ${CRITICAL}
+
+Report: ${env.BUILD_URL}artifact/build/trivy-table.output"""
+          )
+        }
+      }
+    }
+  }
+}
+
+    stage('Create ECS Cluster') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def launchedBy = getJenkinsUsername()
+            def now = new Date()
+            env.LAUNCH_DATE = now.format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC'))
+
+            sh """#!/bin/bash
+set -euo pipefail
+export AWS_REGION=${env.AWS_REGION}
+export AWS_DEFAULT_REGION=${env.AWS_REGION}
+
+CLUSTER_EXISTS=\$(aws ecs describe-clusters --clusters ${env.ECS_CLUSTER_NAME} --query 'clusters[0].status' --output text 2>/dev/null || echo "")
+
+if [ "\$CLUSTER_EXISTS" != "ACTIVE" ]; then
+  echo "Creating ECS cluster: ${env.ECS_CLUSTER_NAME}"
+  aws ecs create-cluster --cluster-name ${env.ECS_CLUSTER_NAME} \
+    --tags key=DeploymentName,value=${env.DEPLOYMENT_NAME} \
+           key=LaunchedBy,value=${launchedBy} \
+           key=LaunchDate,value=${env.LAUNCH_DATE} \
+           key=ENV,value=${env.TAG_NAME} \
+           key=costCenter,value=${env.COST_CENTER_TAG} \
+    --region ${env.AWS_REGION}
+else
+  echo "Cluster already exists: ${env.ECS_CLUSTER_NAME}"
+fi
+"""
+          }
+        }
+      }
+    }
+
+    
+// stage('Create Target Group') {
+// when {
+//   expression { return env.DEPLOYMENT_TYPE != 'Worker' }
+// }
+//   steps {
+//     withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+//       script {
+
+//         def tgName = ("uat-" + env.DEPLOYMENT_NAME)
+//           .replaceAll('[^a-z0-9-]', '-')
+//           .take(32)
+
+//         def tgArn = sh(script: """
+//           aws elbv2 describe-target-groups \
+//             --names ${tgName} \
+//             --region ${env.AWS_REGION} \
+//             --query 'TargetGroups[0].TargetGroupArn' \
+//             --output text 2>/dev/null || echo ""
+//         """, returnStdout: true).trim()
+
+//         if (!tgArn || tgArn == 'None') {
+//           tgArn = sh(script: """
+//             aws elbv2 create-target-group \
+//               --name ${tgName} \
+//               --protocol HTTP \
+//               --port ${env.DEPLOYMENT_PORT} \
+//               --vpc-id ${env.VPC_ID} \
+//               --target-type ip \
+//               --health-check-protocol HTTP \
+//               --health-check-path ${env.HEALTHCHECK_PATH} \
+//               --health-check-interval-seconds 15 \
+//               --health-check-timeout-seconds 5 \
+//               --healthy-threshold-count 2 \
+//               --unhealthy-threshold-count 2 \
+//               --matcher HttpCode=200-399 \
+//               --region ${env.AWS_REGION} \
+//               --query 'TargetGroups[0].TargetGroupArn' \
+//               --output text
+//           """, returnStdout: true).trim()
+//         }
+
+//         env.TG_ARN = tgArn
+//         env.TG_NAME = tgName
+
+//         echo "Target Group: ${env.TG_ARN}"
+
+//         // ==================================================
+//         // ✅ Sticky Sessions (ONLY when Multi-AZ enabled)
+//         // ==================================================
+//         if (params.MULTI_AZ) {
+
+//           echo "Enabling ALB Sticky Sessions (lb_cookie)..."
+
+//           sh """#!/bin/bash
+// set -euo pipefail
+
+// aws elbv2 modify-target-group-attributes \
+//   --target-group-arn ${env.TG_ARN} \
+//   --attributes \
+//     Key=stickiness.enabled,Value=true \
+//     Key=stickiness.type,Value=lb_cookie \
+//     Key=stickiness.lb_cookie.duration_seconds,Value=86400 \
+//   --region ${env.AWS_REGION}
+// """
+
+//           echo "Sticky sessions enabled (24h LB cookie)"
+//         } else {
+//           echo "Sticky sessions disabled (single-AZ mode)"
+//         }
+//       }
+//     }
+//   }
+// }
+ stage('Create Target Group') {
+when {
+  expression { return env.DEPLOYMENT_TYPE != 'Worker' }
+}
+  steps {
+    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+      script {
+        def tgName = ("uat-" + env.DEPLOYMENT_NAME)
+          .replaceAll('[^a-z0-9-]', '-')
+          .take(32)
+        def tgArn = sh(script: """
+          aws elbv2 describe-target-groups \
+            --names ${tgName} \
+            --region ${env.AWS_REGION} \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text 2>/dev/null || echo ""
+        """, returnStdout: true).trim()
+        if (!tgArn || tgArn == 'None') {
+          tgArn = sh(script: """
+            aws elbv2 create-target-group \
+              --name ${tgName} \
+              --protocol HTTP \
+              --port ${env.DEPLOYMENT_PORT} \
+              --vpc-id ${env.VPC_ID} \
+              --target-type ip \
+              --health-check-protocol HTTP \
+              --health-check-path ${env.HEALTHCHECK_PATH} \
+              --health-check-interval-seconds 15 \
+              --health-check-timeout-seconds 5 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 2 \
+              --matcher HttpCode=200-399 \
+              --tags Key=costCenter,Value=${env.COST_CENTER_TAG} Key=DeploymentName,Value=${env.DEPLOYMENT_NAME} Key=ENV,Value=${env.TAG_NAME} \
+              --region ${env.AWS_REGION} \
+              --query 'TargetGroups[0].TargetGroupArn' \
+              --output text
+          """, returnStdout: true).trim()
+        } else {
+          sh """#!/bin/bash
+            aws elbv2 add-tags --resource-arns ${tgArn} \
+              --tags Key=costCenter,Value=${env.COST_CENTER_TAG} Key=DeploymentName,Value=${env.DEPLOYMENT_NAME} Key=ENV,Value=${env.TAG_NAME} \
+              --region ${env.AWS_REGION} || true
+          """
+        }
+        env.TG_ARN = tgArn
+        env.TG_NAME = tgName
+        echo "Target Group: ${env.TG_ARN}"
+        // ==================================================
+        // Sticky Sessions (ONLY when Multi-AZ enabled)
+        // ==================================================
+        if (params.MULTI_AZ) {
+          echo "Enabling ALB Sticky Sessions (lb_cookie)..."
+          sh """#!/bin/bash
+set -euo pipefail
+aws elbv2 modify-target-group-attributes \
+  --target-group-arn ${env.TG_ARN} \
+  --attributes \
+    Key=stickiness.enabled,Value=true \
+    Key=stickiness.type,Value=lb_cookie \
+    Key=stickiness.lb_cookie.duration_seconds,Value=86400 \
+  --region ${env.AWS_REGION}
+"""
+          echo "Sticky sessions enabled (24h LB cookie)"
+        } else {
+          echo "Sticky sessions disabled (single-AZ mode)"
+        }
+      }
+    }
+  }
+}
+
+//     stage('Create ALB Listener Rule') {
+//     when {
+//      expression { return env.DEPLOYMENT_TYPE != 'Worker' }
+//       }
+//       steps {
+//         withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+//           script {
+//             def hostFqdn = "${env.DEPLOYMENT_NAME}.${env.BASE_DOMAIN}".toLowerCase()
+//             env.HOST_FQDN = hostFqdn
+
+//             sh """#!/usr/bin/env bash
+// set -euo pipefail
+// export AWS_REGION=${env.AWS_REGION}
+// export AWS_DEFAULT_REGION=${env.AWS_REGION}
+
+// ALB_ARN='${env.ALB_ARN}'
+// TG_ARN='${env.TG_ARN}'
+// HOST_FQDN='${hostFqdn}'
+
+// echo "Finding HTTPS listener..."
+// LISTENER_JSON=\$(aws elbv2 describe-listeners --load-balancer-arn "\$ALB_ARN" --output json)
+// LISTENER_ARN=\$(python3 - "\$LISTENER_JSON" <<'PY'
+// import json, sys
+// raw = sys.argv[1] if len(sys.argv) > 1 else ""
+// data = json.loads(raw)
+// listeners = data.get("Listeners", [])
+// def pick(port):
+//     for l in listeners:
+//         if l.get("Port") == port:
+//             return l.get("ListenerArn")
+//     return None
+// arn = pick(443) or pick(80) or (listeners[0].get("ListenerArn") if listeners else "")
+// print(arn or "")
+// PY
+// )
+
+// if [ -z "\$LISTENER_ARN" ]; then
+//   echo "No listener found"
+//   exit 1
+// fi
+// echo "Listener: \$LISTENER_ARN"
+
+// echo "Checking for existing host rule..."
+// EXISTING_RULE_ARN=\$(aws elbv2 describe-rules --listener-arn "\$LISTENER_ARN" \\
+//   --query "Rules[?Conditions[?Field=='host-header' && Values[0]=='\$HOST_FQDN']].RuleArn | [0]" \\
+//   --output text 2>/dev/null || true)
+
+// if [ -n "\$EXISTING_RULE_ARN" ] && [ "\$EXISTING_RULE_ARN" != "None" ]; then
+//   echo "Updating rule: \$EXISTING_RULE_ARN"
+//   aws elbv2 modify-rule --rule-arn "\$EXISTING_RULE_ARN" \\
+//     --conditions Field=host-header,Values="\$HOST_FQDN" \\
+//     --actions Type=forward,TargetGroupArn="\$TG_ARN" >/dev/null
+// else
+//   echo "Creating new rule..."
+//   PRIORITY=200
+//   while aws elbv2 describe-rules --listener-arn "\$LISTENER_ARN" \\
+//     --query "Rules[?Priority=='\$PRIORITY']" --output text | grep -q .; do
+//     PRIORITY=\$((PRIORITY+1))
+//   done
+//   aws elbv2 create-rule \\
+//     --listener-arn "\$LISTENER_ARN" \\
+//     --priority "\$PRIORITY" \\
+//     --conditions Field=host-header,Values="\$HOST_FQDN" \\
+//     --actions Type=forward,TargetGroupArn="\$TG_ARN" >/dev/null
+// fi
+
+// echo "Listener rule created/updated for \$HOST_FQDN"
+// """
+//           }
+//         }
+//       }
+//     }
+stage('Create ALB Listener Rule') {
+    when {
+     expression { return env.DEPLOYMENT_TYPE != 'Worker' }
+      }
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def hostFqdn = "${env.DEPLOYMENT_NAME}.${env.BASE_DOMAIN}".toLowerCase()
+            env.HOST_FQDN = hostFqdn
+            sh """#!/usr/bin/env bash
+set -euo pipefail
+export AWS_REGION=${env.AWS_REGION}
+export AWS_DEFAULT_REGION=${env.AWS_REGION}
+ALB_ARN='${env.ALB_ARN}'
+TG_ARN='${env.TG_ARN}'
+HOST_FQDN='${hostFqdn}'
+echo "Finding HTTPS listener..."
+LISTENER_JSON=\$(aws elbv2 describe-listeners --load-balancer-arn "\$ALB_ARN" --output json)
+LISTENER_ARN=\$(python3 - "\$LISTENER_JSON" <<'PY'
+import json, sys
+raw = sys.argv[1] if len(sys.argv) > 1 else ""
+data = json.loads(raw)
+listeners = data.get("Listeners", [])
+def pick(port):
+    for l in listeners:
+        if l.get("Port") == port:
+            return l.get("ListenerArn")
+    return None
+arn = pick(443) or pick(80) or (listeners[0].get("ListenerArn") if listeners else "")
+print(arn or "")
+PY
+)
+if [ -z "\$LISTENER_ARN" ]; then
+  echo "No listener found"
+  exit 1
+fi
+echo "Listener: \$LISTENER_ARN"
+echo "Checking for existing host rule..."
+EXISTING_RULE_ARN=\$(aws elbv2 describe-rules --listener-arn "\$LISTENER_ARN" \\
+  --query "Rules[?Conditions[?Field=='host-header' && Values[0]=='\$HOST_FQDN']].RuleArn | [0]" \\
+  --output text 2>/dev/null || true)
+if [ -n "\$EXISTING_RULE_ARN" ] && [ "\$EXISTING_RULE_ARN" != "None" ]; then
+  echo "Updating rule: \$EXISTING_RULE_ARN"
+  aws elbv2 modify-rule --rule-arn "\$EXISTING_RULE_ARN" \\
+    --conditions Field=host-header,Values="\$HOST_FQDN" \\
+    --actions Type=forward,TargetGroupArn="\$TG_ARN" >/dev/null
+  RULE_ARN_TO_TAG="\$EXISTING_RULE_ARN"
+else
+  echo "Creating new rule..."
+  PRIORITY=200
+  while aws elbv2 describe-rules --listener-arn "\$LISTENER_ARN" \\
+    --query "Rules[?Priority=='\$PRIORITY']" --output text | grep -q .; do
+    PRIORITY=\$((PRIORITY+1))
+  done
+  RULE_ARN_TO_TAG=\$(aws elbv2 create-rule \\
+    --listener-arn "\$LISTENER_ARN" \\
+    --priority "\$PRIORITY" \\
+    --conditions Field=host-header,Values="\$HOST_FQDN" \\
+    --actions Type=forward,TargetGroupArn="\$TG_ARN" \\
+    --query 'Rules[0].RuleArn' --output text)
+fi
+aws elbv2 add-tags --resource-arns "\$RULE_ARN_TO_TAG" \\
+  --tags Key=costCenter,Value=${env.COST_CENTER_TAG} Key=DeploymentName,Value=${env.DEPLOYMENT_NAME} || true
+echo "Listener rule created/updated for \$HOST_FQDN"
+"""
+          }
+        }
+      }
+    }
+
+//     stage('Create CloudWatch Log Group') {
+//       steps {
+//         withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+//           script {
+//             def logGroupName = "/ecs/${env.DEPLOYMENT_NAME}"
+
+//             sh """#!/bin/bash
+// aws logs create-log-group --log-group-name ${logGroupName} --region ${env.AWS_REGION} 2>/dev/null || true
+// aws logs put-retention-policy --log-group-name ${logGroupName} --retention-in-days 7 --region ${env.AWS_REGION}
+// """
+//             env.LOG_GROUP_NAME = logGroupName
+//           }
+//         }
+//       }
+//     }
+
+stage('Create CloudWatch Log Group') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            def logGroupName = "/ecs/${env.DEPLOYMENT_NAME}"
+            sh """#!/bin/bash
+aws logs create-log-group --log-group-name ${logGroupName} --region ${env.AWS_REGION} 2>/dev/null || true
+aws logs put-retention-policy --log-group-name ${logGroupName} --retention-in-days 7 --region ${env.AWS_REGION}
+aws logs tag-log-group --log-group-name ${logGroupName} \
+  --tags costCenter=${env.COST_CENTER_TAG},DeploymentName=${env.DEPLOYMENT_NAME},ENV=${env.TAG_NAME} \
+  --region ${env.AWS_REGION} || true
+"""
+            env.LOG_GROUP_NAME = logGroupName
+          }
+        }
+      }
+    }
+
+stage('Register Task Definition') {
+  steps {
+    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+      script {
+          
+        echo "========================================"
+        echo "Checking ECS Task Definition existence..."
+        echo "Family: ${env.ECS_TASK_FAMILY}"
+        echo "========================================"
+
+        // ==================================================
+        // CHECK IF TASK DEFINITION ALREADY EXISTS
+        // ==================================================
+        def existingTaskDefs = sh(script: """
+          aws ecs list-task-definitions \
+            --family-prefix ${env.ECS_TASK_FAMILY} \
+            --status ACTIVE \
+            --region ${env.AWS_REGION} \
+            --query 'taskDefinitionArns[0]' \
+            --output text
+        """, returnStdout: true).trim()
+
+        if (existingTaskDefs &&
+            existingTaskDefs != "None" &&
+            existingTaskDefs != "null") {
+
+          error """
+❌ PIPELINE STOPPED ❌
+
+ECS Task Definition already exists for family:
+${env.ECS_TASK_FAMILY}
+
+Existing Task Definition ARN:
+${existingTaskDefs}
+
+Reason:
+This pipeline enforces STRICT IMMUTABILITY:
+- No duplicate task definition family is allowed
+- Prevents accidental redeploy over existing ECS configuration
+"""
+        }
+
+        echo "No existing task definition found. Proceeding with creation..."
+          def mergedEnvironment = mergeEnvironmentVariables([
+              [name: 'ASPNETCORE_ENVIRONMENT', value: 'UAT'],
+              [name: 'METRICS_PORT', value: '9464']
+            ], params.Environment_Variables)
+
+    def mergedEnvironmentJson = JsonOutput.toJson(mergedEnvironment)
+        def taskDef = """
+{
+  "family": "${env.ECS_TASK_FAMILY}",
+  "executionRoleArn": "${env.ECS_EXECUTION_ROLE_ARN}",
+  "taskRoleArn": "arn:aws:iam::715451173743:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "${env.CPU_VALUE}",
+  "memory": "${env.MEMORY_VALUE}",
+  "runtimePlatform": {
+    "cpuArchitecture": "${env.CPU_ARCH}",
+    "operatingSystemFamily": "LINUX"
+  },
+  "containerDefinitions": [
+    {
+      "name": "${env.DEPLOYMENT_NAME}",
+      "image": "${env.FULL_IMAGE_URI}",
+      "essential": true,
+      "command": ${env.CONTAINER_COMMAND_JSON},
+      "portMappings": [
+        {
+          "containerPort": ${env.DEPLOYMENT_PORT},
+          "protocol": "tcp"
+        },
+        {
+          "containerPort": 9464,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": ${mergedEnvironmentJson},
+      "logConfiguration": {
+        "logDriver": "awsfirelens",
+        "options": {
+          "Host": "loki.moresand.io",
+          "Label_Keys": "\$container_name",
+          "Labels": "Application=CMB-Dynamic-UAT-${env.DEPLOYMENT_NAME}",
+          "Line_Format": "json",
+          "Name": "loki",
+          "Port": "80"
+        }
+      }
+    },
+  {
+  "name": "log_router",
+  "image": "${env.FLUENT_IMAGE}",
+  "cpu": 0,
+  "memoryReservation": 50,
+  "links": [],
+  "portMappings": [],
+  "essential": true,
+  "entryPoint": [],
+  "command": [],
+  "environment": [],
+  "environmentFiles": [],
+  "mountPoints": [],
+  "volumesFrom": [],
+  "secrets": [],
+  "user": "0",
+  "dnsServers": [],
+  "dnsSearchDomains": [],
+  "extraHosts": [],
+  "dockerSecurityOptions": [],
+  "dockerLabels": {},
+  "ulimits": [],
+  "logConfiguration": {
+    "logDriver": "awslogs",
+    "options": {
+      "awslogs-group": "/ecs/${env.DEPLOYMENT_NAME}/fluentbit.${env.DEPLOYMENT_NAME}",
+      "awslogs-create-group": "true",
+      "awslogs-region": "${env.AWS_REGION}",
+      "awslogs-stream-prefix": "ecs"
+    },
+    "secretOptions": []
+  },
+  "systemControls": [],
+  "firelensConfiguration": {
+    "type": "fluentbit",
+    "options": {
+      "config-file-type": "file",
+      "config-file-value": "/extra.conf",
+      "enable-ecs-log-metadata": "true"
+    }
+  }
+}
+  ],
+  "tags": [
+    { "key": "DeploymentName", "value": "${env.DEPLOYMENT_NAME}" },
+    { "key": "ENV", "value": "${env.TAG_NAME}" },
+    { "key": "costCenter", "value": "${env.COST_CENTER_TAG}" }
+  ]
+}
+"""
+
+        writeFile file: 'task-definition.json', text: taskDef
+
+        def taskDefArn = sh(
+          script: """
+            aws ecs register-task-definition \
+              --cli-input-json file://task-definition.json \
+              --region ${env.AWS_REGION} \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text
+          """,
+          returnStdout: true
+        ).trim()
+
+        env.TASK_DEF_ARN = taskDefArn
+        echo "Task Definition: ${env.TASK_DEF_ARN}"
+      }
+    }
+  }
+}
+
+stage('Create ECS Service') {
+  steps {
+    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+      script {
+        def isWorker = (env.DEPLOYMENT_TYPE == 'Worker')
+        // ==================================================
+        // CHECK IF SERVICE EXISTS
+        // ==================================================
+        def serviceExists = sh(script: """
+          aws ecs describe-services \
+            --cluster ${env.ECS_CLUSTER_NAME} \
+            --services ${env.ECS_SERVICE_NAME} \
+            --region ${env.AWS_REGION} \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || echo ""
+        """, returnStdout: true).trim()
+        if (serviceExists && serviceExists != 'INACTIVE' && serviceExists != 'None' && serviceExists != 'NoneType') {
+          echo "Service already exists: ${env.ECS_SERVICE_NAME}"
+          error("Pipeline stopped: ECS service already exists. No updates allowed.")
+        }
+        // ==================================================
+        // CREATE NEW SERVICE ONLY
+        // Note: --enable-ecs-managed-tags + --propagate-tags SERVICE
+        // ensures the Fargate tasks/ENIs launched by this service
+        // inherit the costCenter tag for cost-allocation reporting.
+        // ==================================================
+        echo "Creating NEW ECS service (no updates allowed)..."
+        if (isWorker) {
+          echo "Worker mode -> creating ECS service WITHOUT ALB"
+          sh """#!/bin/bash
+aws ecs create-service \
+  --cluster ${env.ECS_CLUSTER_NAME} \
+  --service-name ${env.ECS_SERVICE_NAME} \
+  --task-definition ${env.TASK_DEF_ARN} \
+  --desired-count ${env.DESIRED_COUNT} \
+  --capacity-provider-strategy capacityProvider=FARGATE,weight=1,base=1 capacityProvider=FARGATE_SPOT,weight=1 \
+  --network-configuration "awsvpcConfiguration={subnets=[${env.SUBNET_LIST}],securityGroups=[${env.SG_ID}],assignPublicIp=ENABLED}" \
+  --enable-ecs-managed-tags \
+  --propagate-tags SERVICE \
+  --region ${env.AWS_REGION}
+"""
+        } else {
+          echo "Web/API mode -> creating ECS service WITH ALB"
+          sh """#!/bin/bash
+aws ecs create-service \
+  --cluster ${env.ECS_CLUSTER_NAME} \
+  --service-name ${env.ECS_SERVICE_NAME} \
+  --task-definition ${env.TASK_DEF_ARN} \
+  --desired-count ${env.DESIRED_COUNT} \
+  --capacity-provider-strategy capacityProvider=FARGATE,weight=1,base=1 capacityProvider=FARGATE_SPOT,weight=1 \
+  --network-configuration "awsvpcConfiguration={subnets=[${env.SUBNET_LIST}],securityGroups=[${env.SG_ID}],assignPublicIp=ENABLED}" \
+  --load-balancers "targetGroupArn=${env.TG_ARN},containerName=${env.DEPLOYMENT_NAME},containerPort=${env.DEPLOYMENT_PORT}" \
+  --enable-ecs-managed-tags \
+  --propagate-tags SERVICE \
+  --region ${env.AWS_REGION}
+"""
+        }
+        // ==================================================
+        // TAG SERVICE (ONLY AFTER CREATION)
+        // ==================================================
+        sh """#!/bin/bash
+set -euo pipefail
+SERVICE_ARN=\$(aws ecs describe-services \
+  --cluster ${env.ECS_CLUSTER_NAME} \
+  --services ${env.ECS_SERVICE_NAME} \
+  --region ${env.AWS_REGION} \
+  --query 'services[0].serviceArn' \
+  --output text)
+aws ecs tag-resource \
+  --resource-arn "\$SERVICE_ARN" \
+  --tags \
+    key=DeploymentName,value=${env.DEPLOYMENT_NAME} \
+    key=ENV,value=${env.TAG_NAME} \
+    key=BitbucketRepo,value=${env.SELECTED_BITBUCKET_REPO} \
+    key=BitbucketBranch,value=${env.SELECTED_BITBUCKET_BRANCH} \
+    key=LaunchedBy,value=${getJenkinsUsername()} \
+    key=LaunchDate,value=${env.LAUNCH_DATE} \
+    key=DeploymentType,value=${env.DEPLOYMENT_TYPE} \
+    key=costCenter,value=${env.COST_CENTER_TAG} \
+  --region ${env.AWS_REGION}
+"""
+      }
+    }
+  }
+}
+
+// stage('Create ECS Service') {
+//   steps {
+//     withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+//       script {
+
+//         def isWorker = (env.DEPLOYMENT_TYPE == 'Worker')
+
+//         // ==================================================
+//         // CHECK IF SERVICE EXISTS
+//         // ==================================================
+//         def serviceExists = sh(script: """
+//           aws ecs describe-services \
+//             --cluster ${env.ECS_CLUSTER_NAME} \
+//             --services ${env.ECS_SERVICE_NAME} \
+//             --region ${env.AWS_REGION} \
+//             --query 'services[0].status' \
+//             --output text 2>/dev/null || echo ""
+//         """, returnStdout: true).trim()
+
+//         if (serviceExists && serviceExists != 'INACTIVE' && serviceExists != 'None' && serviceExists != 'NoneType') {
+
+//           echo "❌ Service already exists: ${env.ECS_SERVICE_NAME}"
+//           error("Pipeline stopped: ECS service already exists. No updates allowed.")
+//         }
+
+//         // ==================================================
+//         // CREATE NEW SERVICE ONLY
+//         // ==================================================
+//         echo "Creating NEW ECS service (no updates allowed)..."
+
+//         if (isWorker) {
+
+//           echo "🧠 Worker mode → creating ECS service WITHOUT ALB"
+
+//           sh """#!/bin/bash
+// aws ecs create-service \
+//   --cluster ${env.ECS_CLUSTER_NAME} \
+//   --service-name ${env.ECS_SERVICE_NAME} \
+//   --task-definition ${env.TASK_DEF_ARN} \
+//   --desired-count ${env.DESIRED_COUNT} \
+//   --capacity-provider-strategy capacityProvider=FARGATE,weight=1,base=1 capacityProvider=FARGATE_SPOT,weight=1 \
+//   --network-configuration "awsvpcConfiguration={subnets=[${env.SUBNET_LIST}],securityGroups=[${env.SG_ID}],assignPublicIp=ENABLED}" \
+//   --region ${env.AWS_REGION}
+// """
+//         } else {
+
+//           echo "🌐 Web/API mode → creating ECS service WITH ALB"
+
+//           sh """#!/bin/bash
+// aws ecs create-service \
+//   --cluster ${env.ECS_CLUSTER_NAME} \
+//   --service-name ${env.ECS_SERVICE_NAME} \
+//   --task-definition ${env.TASK_DEF_ARN} \
+//   --desired-count ${env.DESIRED_COUNT} \
+//   --capacity-provider-strategy capacityProvider=FARGATE,weight=1,base=1 capacityProvider=FARGATE_SPOT,weight=1 \
+//   --network-configuration "awsvpcConfiguration={subnets=[${env.SUBNET_LIST}],securityGroups=[${env.SG_ID}],assignPublicIp=ENABLED}" \
+//   --load-balancers "targetGroupArn=${env.TG_ARN},containerName=${env.DEPLOYMENT_NAME},containerPort=${env.DEPLOYMENT_PORT}" \
+//   --region ${env.AWS_REGION}
+// """
+//         }
+
+//         // ==================================================
+//         // TAG SERVICE (ONLY AFTER CREATION)
+//         // ==================================================
+//         sh """#!/bin/bash
+// set -euo pipefail
+
+// SERVICE_ARN=\$(aws ecs describe-services \
+//   --cluster ${env.ECS_CLUSTER_NAME} \
+//   --services ${env.ECS_SERVICE_NAME} \
+//   --region ${env.AWS_REGION} \
+//   --query 'services[0].serviceArn' \
+//   --output text)
+
+// aws ecs tag-resource \
+//   --resource-arn "\$SERVICE_ARN" \
+//   --tags \
+//     key=DeploymentName,value=${env.DEPLOYMENT_NAME} \
+//     key=ENV,value=${env.TAG_NAME} \
+//     key=BitbucketRepo,value=${env.SELECTED_BITBUCKET_REPO} \
+//     key=BitbucketBranch,value=${env.SELECTED_BITBUCKET_BRANCH} \
+//     key=LaunchedBy,value=${getJenkinsUsername()} \
+//     key=LaunchDate,value=${env.LAUNCH_DATE} \
+//     key=DeploymentType,value=${env.DEPLOYMENT_TYPE} \
+//   --region ${env.AWS_REGION}
+// """
+//       }
+//     }
+//   }
+// }
+
+   stage('Wait for Service Stability') {
+  steps {
+    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+
+      script {
+        if (env.DEPLOYMENT_TYPE == 'Worker') {
+          echo "Worker mode → skipping ALB target health wait"
+          sh """#!/bin/bash
+            aws ecs wait services-stable \
+              --cluster ${env.ECS_CLUSTER_NAME} \
+              --services ${env.ECS_SERVICE_NAME} \
+              --region ${env.AWS_REGION}
+          """
+        } else {
+
+          sh """#!/bin/bash
+            aws ecs wait services-stable \
+              --cluster ${env.ECS_CLUSTER_NAME} \
+              --services ${env.ECS_SERVICE_NAME} \
+              --region ${env.AWS_REGION}
+          """
+
+        }
+      }
+    }
+  }
+}
+
+    stage('Create Route53 DNS + Health Check') {
+    when {
+      expression { return env.DEPLOYMENT_TYPE != 'Worker' }
+      }
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+          script {
+            sh """#!/usr/bin/env bash
+set -euo pipefail
+export AWS_REGION=${env.AWS_REGION}
+export AWS_DEFAULT_REGION=${env.AWS_REGION}
+
+ALB_ARN='${env.ALB_ARN}'
+TG_ARN='${env.TG_ARN}'
+HOST_FQDN='${env.HOST_FQDN}'
+PUBLIC_HOSTED_ZONE_ID='${env.PUBLIC_HOSTED_ZONE_ID}'
+
+echo "Discovering ALB details..."
+LB_DESC=\$(aws elbv2 describe-load-balancers --load-balancer-arns "\$ALB_ARN" --output json)
+ALB_DNS=\$(echo "\$LB_DESC" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["LoadBalancers"][0]["DNSName"])')
+ALB_ZONE_ID=\$(echo "\$LB_DESC" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["LoadBalancers"][0]["CanonicalHostedZoneId"])')
+
+echo "ALB_DNS: \$ALB_DNS"
+
+echo "Creating Route53 alias record..."
+TMPFILE=\$(mktemp)
+cat > "\$TMPFILE" <<EOF
+{
+  "Comment": "UPSERT alias for \$HOST_FQDN",
+  "Changes": [
+    {
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "\$HOST_FQDN.",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "\$ALB_ZONE_ID",
+          "DNSName": "\$ALB_DNS",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }
+  ]
+}
+EOF
+aws route53 change-resource-record-sets \\
+  --hosted-zone-id "\$PUBLIC_HOSTED_ZONE_ID" \\
+  --change-batch "file://\$TMPFILE"
+rm -f "\$TMPFILE"
+
+echo "Waiting for target health..."
+for i in {1..30}; do
+  STATE=\$(aws elbv2 describe-target-health --target-group-arn "\$TG_ARN" \\
+    --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text 2>/dev/null || true)
+  echo "Health check \$i: \$STATE"
+  if [ "\$STATE" = "healthy" ]; then
+    echo "Target is healthy"
+    break
+  fi
+  sleep 10
+done
+
+echo "HTTPS URL: https://\$HOST_FQDN/"
+"""
+          }
+        }
+      }
+    }
+
+    stage('Schedule Auto-Delete (optional)') {
+      when { expression { params.AUTO_DELETE == 'true' } }
+      steps {
+        script {
+          def ttl = params.AUTO_DELETE_HOURS ?: '24'
+          writeFile file: 'delete-resources.sh', text: """
+#!/bin/bash
+set -euo pipefail
+export AWS_REGION=${env.AWS_REGION}
+export AWS_DEFAULT_REGION=${env.AWS_REGION}
+
+ECS_CLUSTER="${env.ECS_CLUSTER_NAME}"
+ECS_SERVICE="${env.ECS_SERVICE_NAME}"
+TG_ARN="${env.TG_ARN}"
+LOG_GROUP="${env.LOG_GROUP_NAME}"
+HOST_FQDN="${env.HOST_FQDN ?: ''}"
+ECR_REPO="${env.ECR_REPO_NAME}"
+DEPLOYMENT_NAME="${env.DEPLOYMENT_NAME}"
+
+echo "Deleting ECS service..."
+aws ecs update-service --cluster \$ECS_CLUSTER --service \$ECS_SERVICE --desired-count 0 --region \$AWS_REGION || true
+sleep 30
+aws ecs delete-service --cluster \$ECS_CLUSTER --service \$ECS_SERVICE --force --region \$AWS_REGION || true
+
+echo "Waiting for service deletion..."
+aws ecs wait services-inactive --cluster \$ECS_CLUSTER --services \$ECS_SERVICE --region \$AWS_REGION || true
+
+echo "Deleting ECS cluster..."
+aws ecs delete-cluster --cluster \$ECS_CLUSTER --region \$AWS_REGION || true
+
+echo "Deleting target group..."
+aws elbv2 delete-target-group --target-group-arn \$TG_ARN --region \$AWS_REGION || true
+
+echo "Deleting CloudWatch log group..."
+aws logs delete-log-group --log-group-name \$LOG_GROUP --region \$AWS_REGION || true
+
+echo "Deleting ECR repository..."
+aws ecr delete-repository --repository-name \$ECR_REPO --force --region \$AWS_REGION || true
+
+echo "ECS resources deleted successfully"
+"""
+          archiveArtifacts artifacts: 'delete-resources.sh'
+          echo "Auto-delete script archived. Run manually or set up Lambda/EventBridge for TTL."
+        }
+      }
+    }
+
+    stage('Save Deployment Info') {
+      steps {
+        script {
+          def info = """
+DEPLOYMENT_NAME=${env.DEPLOYMENT_NAME}
+ECS_CLUSTER_NAME=${env.ECS_CLUSTER_NAME}
+ECS_SERVICE_NAME=${env.ECS_SERVICE_NAME}
+TASK_DEF_ARN=${env.TASK_DEF_ARN}
+TG_ARN=${env.TG_ARN}
+TG_NAME=${env.TG_NAME}
+ECR_REPO_URI=${env.ECR_REPO_URI}
+LOG_GROUP_NAME=${env.LOG_GROUP_NAME}
+HOST_FQDN=${env.HOST_FQDN ?: ''}
+IMAGE_TAG=${env.IMAGE_TAG}
+BITBUCKET_REPO=${env.SELECTED_BITBUCKET_REPO ?: ''}
+BITBUCKET_BRANCH=${env.SELECTED_BITBUCKET_BRANCH ?: ''}
+"""
+          writeFile file: '.ecs_deployment_info', text: info
+          archiveArtifacts artifacts: '.ecs_deployment_info'
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        echo """
+========================================
+ECS DEPLOYMENT SUCCESSFUL
+========================================
+Deployment Name  : ${env.DEPLOYMENT_NAME}
+ECS Cluster      : ${env.ECS_CLUSTER_NAME}
+ECS Service      : ${env.ECS_SERVICE_NAME}
+Target Group     : ${env.TG_NAME}
+ECR Repository   : ${env.ECR_REPO_URI}
+Task Definition  : ${env.TASK_DEF_ARN}
+Please use this Keyword for view your Grafana Logs :  CMB-Dynamic-UAT-${env.DEPLOYMENT_NAME}
+Access URL : ${env.DEPLOYMENT_TYPE == 'Worker' ? 'N/A (Worker Service)' : "https://${env.HOST_FQDN}/"}
+========================================
+"""
+      }
+    }
+    failure {
+      echo "ECS Deployment failed"
+    }
+  }
+}
