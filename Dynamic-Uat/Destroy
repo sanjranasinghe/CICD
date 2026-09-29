@@ -12,7 +12,7 @@ pipeline {
     AWS_REGION            = "${params.Region ?: 'eu-west-2'}"
     AWS_DEFAULT_REGION    = "${params.Region ?: 'eu-west-2'}"
     AWS_CREDENTIALS_ID    = 'London_Region'
-    ALB_ARN               = 'arn:aws:elasticloadbalancing:eu-west-2:715451173743:loadbalancer/app/Sandbox-Dynamic-UAT-LB/f019785ce5474a92'
+    ALB_ARN               = 'arn:aws:elasticloadbalancing:eu-west-2:*******:loadbalancer/app/Sandbox-Dynamic-UAT-LB/f019785ce5474a92'
     BASE_DOMAIN           = 'uat.moresand.io'
     PUBLIC_HOSTED_ZONE_ID = 'Z1022656K7AKO21GKF5F'
   }
